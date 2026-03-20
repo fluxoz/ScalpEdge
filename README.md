@@ -30,7 +30,10 @@ nix develop
 # 2. Install Python dependencies
 uv sync
 
-# 3. Run the full backtest
+# 3. (Optional) Install ML dependencies (scikit-learn + PyTorch)
+uv sync --extra ml
+
+# 4. Run the full backtest
 uv run python main.py
 ```
 
@@ -38,14 +41,16 @@ uv run python main.py
 
 ```bash
 # Requires Python 3.12+ and uv installed
-uv sync
+uv sync                  # core deps only
+uv sync --extra ml       # + ML layer (optional)
 uv run python main.py
 ```
 
 ### Option C — plain pip
 
 ```bash
-pip install -e ".[dev]"
+pip install -e "."       # core deps only
+pip install -e ".[ml]"   # + ML layer (optional)
 python main.py
 ```
 

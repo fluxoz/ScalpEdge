@@ -17,15 +17,17 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 import numpy as np
 import pandas as pd
 
 from .backtester import Backtester, BacktestResult
-from .ml import MLEngine
 from .options import BlackScholes
 from .probabilities import MarkovChain, MonteCarlo
+
+if TYPE_CHECKING:
+    from .ml import MLEngine
 
 logger = logging.getLogger(__name__)
 
@@ -173,6 +175,8 @@ class HybridStrategy(BaseStrategy):
     def fit_ml(self, df: pd.DataFrame) -> "HybridStrategy":
         """Fit ML models (RF + LSTM) on *df*. Call before generate_signals."""
         if self.use_ml:
+            from .ml import MLEngine
+
             self._ml = MLEngine()
             self._ml.fit(df)
         return self
