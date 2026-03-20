@@ -21,6 +21,14 @@
             pkgs.git
           ];
 
+          # Compiled Python wheels (numpy, scipy, etc.) contain .so files that
+          # depend on libstdc++ and libz.  In Nix these live in the store, not
+          # at /usr/lib, so we must tell the dynamic linker where to find them.
+          LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
+            pkgs.stdenv.cc.cc.lib
+            pkgs.zlib
+          ];
+
           shellHook = ''
             echo ""
             echo "  ╔═══════════════════════════════════════╗"
@@ -30,9 +38,11 @@
             echo "  Run:  uv sync && uv run python main.py"
             echo ""
 
-            # Create a local virtual environment managed by uv
+            # Virtual environment managed by uv
             export UV_PROJECT_ENVIRONMENT=".venv"
-            export PYTHONPATH="$PWD:$PYTHONPATH"
+            # Use the Nix-provided Python — never download a separate one
+            export UV_PYTHON_DOWNLOADS=never
+            export UV_PYTHON="${python}/bin/python3"
           '';
         };
       }

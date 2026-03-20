@@ -172,6 +172,20 @@ strategy = HybridStrategy(extra_rules=[my_rule])
 
 ---
 
+## Troubleshooting
+
+### `Error importing numpy: you should not try to import numpy from its source directory`
+
+The virtual environment is out of sync with the current Python interpreter. This typically happens when switching between environments (e.g. entering a Nix devshell after the `.venv` was already created).
+
+**Fix:**
+
+```bash
+rm -rf .venv && uv sync && uv run python main.py
+```
+
+---
+
 ## License
 
 MIT — use at your own risk.
