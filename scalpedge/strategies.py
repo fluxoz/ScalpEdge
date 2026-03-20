@@ -282,7 +282,7 @@ class HybridStrategy(BaseStrategy):
         """
         import math
 
-        T = max(0.0 / 252, 1 / (252 * 6.5 * 12))  # ~5-minute 0DTE horizon
+        T = 1 / (252 * 6.5 * 12)  # ~5-minute 0DTE horizon
         sigma = self.bs_sigma
         # ATM: d1 = (r + 0.5*sigma^2) * T / (sigma * sqrt(T))
         # With T so small, d1 ≈ 0 → delta ≈ 0.5 regardless of sigma.

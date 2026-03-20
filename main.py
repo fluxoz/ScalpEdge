@@ -100,8 +100,6 @@ def run_backtest(ticker: str) -> None:
     # ------------------------------------------------------------------
     logger.info("[%s] Running TA-only baseline ...", ticker)
     ta_strategy = TAStrategy()
-    bt = Backtester(**BACKTEST_CONFIG)
-    from scalpedge.backtester import Backtester
     ta_result = ta_strategy.backtest(df, ticker=ticker, **BACKTEST_CONFIG)
     print(ta_result.summary())
 

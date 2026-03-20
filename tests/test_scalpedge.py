@@ -319,7 +319,6 @@ class TestBacktester:
         result = bt.run(clean_df, signal, ticker="TEST")
         assert result.n_trades > 0
         assert 0.0 <= result.win_rate <= 1.0
-        assert result.n_trades > 0
 
     def test_equity_curve_length(self, clean_df):
         from scalpedge.backtester import Backtester
