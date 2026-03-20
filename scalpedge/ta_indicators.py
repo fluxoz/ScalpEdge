@@ -1,0 +1,619 @@
+"""Technical Analysis indicators module.
+
+Adds EMA, SMA, RSI, MACD, Bollinger Bands, ATR, OBV, VWAP, and 60+
+candlestick pattern columns to a 5-minute OHLCV DataFrame.
+
+All computations are vectorized (pandas / numpy).  ``pandas-ta`` is used
+for the heavy lifting so every indicator is available from one function call.
+"""
+
+from __future__ import annotations
+
+import logging
+
+import numpy as np
+import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Candlestick pattern helpers (pure numpy / pandas — no extra lib required)
+# ---------------------------------------------------------------------------
+
+def _body(o: pd.Series, c: pd.Series) -> pd.Series:
+    return (c - o).abs()
+
+
+def _upper_shadow(o: pd.Series, h: pd.Series, c: pd.Series) -> pd.Series:
+    return h - pd.concat([o, c], axis=1).max(axis=1)
+
+
+def _lower_shadow(o: pd.Series, l: pd.Series, c: pd.Series) -> pd.Series:
+    return pd.concat([o, c], axis=1).min(axis=1) - l
+
+
+def _candle_range(h: pd.Series, l: pd.Series) -> pd.Series:
+    return h - l
+
+
+def _bull(o: pd.Series, c: pd.Series) -> pd.Series:
+    return c > o
+
+
+def _bear(o: pd.Series, c: pd.Series) -> pd.Series:
+    return c < o
+
+
+# ---------------------------------------------------------------------------
+# Main public function
+# ---------------------------------------------------------------------------
+
+def add_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute and append all TA indicators + candlestick patterns.
+
+    Requires columns: ``open``, ``high``, ``low``, ``close``, ``volume``.
+    Returns the same DataFrame (copy) with new columns appended.
+    """
+    df = df.copy()
+
+    o = df["open"].astype(float)
+    h = df["high"].astype(float)
+    l = df["low"].astype(float)
+    c = df["close"].astype(float)
+    v = df["volume"].astype(float)
+
+    # -----------------------------------------------------------------------
+    # Moving averages
+    # -----------------------------------------------------------------------
+    for period in (9, 21, 50, 200):
+        df[f"ema_{period}"] = c.ewm(span=period, adjust=False).mean()
+        df[f"sma_{period}"] = c.rolling(period).mean()
+
+    # -----------------------------------------------------------------------
+    # RSI (Wilder smoothing)
+    # -----------------------------------------------------------------------
+    df["rsi_14"] = _rsi(c, 14)
+
+    # -----------------------------------------------------------------------
+    # MACD (12, 26, 9)
+    # -----------------------------------------------------------------------
+    ema12 = c.ewm(span=12, adjust=False).mean()
+    ema26 = c.ewm(span=26, adjust=False).mean()
+    df["macd"] = ema12 - ema26
+    df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
+    df["macd_hist"] = df["macd"] - df["macd_signal"]
+
+    # -----------------------------------------------------------------------
+    # Bollinger Bands (20, 2σ)
+    # -----------------------------------------------------------------------
+    bb_mid = c.rolling(20).mean()
+    bb_std = c.rolling(20).std(ddof=0)
+    df["bb_upper"] = bb_mid + 2 * bb_std
+    df["bb_mid"] = bb_mid
+    df["bb_lower"] = bb_mid - 2 * bb_std
+    df["bb_width"] = (df["bb_upper"] - df["bb_lower"]) / bb_mid.replace(0, np.nan)
+    df["bb_pct"] = (c - df["bb_lower"]) / (df["bb_upper"] - df["bb_lower"]).replace(0, np.nan)
+
+    # -----------------------------------------------------------------------
+    # ATR (14)
+    # -----------------------------------------------------------------------
+    df["atr_14"] = _atr(h, l, c, 14)
+
+    # -----------------------------------------------------------------------
+    # OBV
+    # -----------------------------------------------------------------------
+    direction = np.where(c > c.shift(1), 1, np.where(c < c.shift(1), -1, 0))
+    df["obv"] = (v * direction).cumsum()
+
+    # -----------------------------------------------------------------------
+    # VWAP (rolling intraday approximation — resets are per-session)
+    # -----------------------------------------------------------------------
+    df["vwap"] = _vwap(df)
+
+    # -----------------------------------------------------------------------
+    # Stochastic oscillator (14, 3)
+    # -----------------------------------------------------------------------
+    lowest_low = l.rolling(14).min()
+    highest_high = h.rolling(14).max()
+    df["stoch_k"] = 100 * (c - lowest_low) / (highest_high - lowest_low).replace(0, np.nan)
+    df["stoch_d"] = df["stoch_k"].rolling(3).mean()
+
+    # -----------------------------------------------------------------------
+    # Williams %R (14)
+    # -----------------------------------------------------------------------
+    df["williams_r"] = -100 * (highest_high - c) / (highest_high - lowest_low).replace(0, np.nan)
+
+    # -----------------------------------------------------------------------
+    # CCI (20)
+    # -----------------------------------------------------------------------
+    typical = (h + l + c) / 3
+    df["cci_20"] = (typical - typical.rolling(20).mean()) / (
+        0.015 * typical.rolling(20).std(ddof=0)
+    ).replace(0, np.nan)
+
+    # -----------------------------------------------------------------------
+    # MFI — Money Flow Index (14)
+    # -----------------------------------------------------------------------
+    df["mfi_14"] = _mfi(h, l, c, v, 14)
+
+    # -----------------------------------------------------------------------
+    # ADX / DI+ / DI- (14)
+    # -----------------------------------------------------------------------
+    df["adx_14"], df["di_plus_14"], df["di_minus_14"] = _adx(h, l, c, 14)
+
+    # -----------------------------------------------------------------------
+    # ROC (rate of change, 12 bars)
+    # -----------------------------------------------------------------------
+    df["roc_12"] = c.pct_change(12) * 100
+
+    # -----------------------------------------------------------------------
+    # Price distance from VWAP (%)
+    # -----------------------------------------------------------------------
+    df["price_vs_vwap"] = (c - df["vwap"]) / df["vwap"].replace(0, np.nan) * 100
+
+    # -----------------------------------------------------------------------
+    # Candlestick patterns (60+)
+    # -----------------------------------------------------------------------
+    df = _add_candlestick_patterns(df, o, h, l, c)
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Indicator helpers
+# ---------------------------------------------------------------------------
+
+def _rsi(close: pd.Series, period: int) -> pd.Series:
+    delta = close.diff()
+    gain = delta.clip(lower=0).ewm(com=period - 1, min_periods=period).mean()
+    loss = (-delta.clip(upper=0)).ewm(com=period - 1, min_periods=period).mean()
+    rs = gain / loss.replace(0, np.nan)
+    return 100 - 100 / (1 + rs)
+
+
+def _atr(h: pd.Series, l: pd.Series, c: pd.Series, period: int) -> pd.Series:
+    prev_c = c.shift(1)
+    tr = pd.concat(
+        [h - l, (h - prev_c).abs(), (l - prev_c).abs()], axis=1
+    ).max(axis=1)
+    return tr.ewm(com=period - 1, min_periods=period).mean()
+
+
+def _mfi(
+    h: pd.Series, l: pd.Series, c: pd.Series, v: pd.Series, period: int
+) -> pd.Series:
+    tp = (h + l + c) / 3
+    mf = tp * v
+    pos = mf.where(tp > tp.shift(1), 0.0)
+    neg = mf.where(tp < tp.shift(1), 0.0)
+    pos_sum = pos.rolling(period).sum()
+    neg_sum = neg.rolling(period).sum()
+    mfr = pos_sum / neg_sum.replace(0, np.nan)
+    return 100 - 100 / (1 + mfr)
+
+
+def _adx(
+    h: pd.Series, l: pd.Series, c: pd.Series, period: int
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    prev_h = h.shift(1)
+    prev_l = l.shift(1)
+    prev_c = c.shift(1)
+
+    tr = pd.concat([h - l, (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
+    dm_plus = np.where((h - prev_h) > (prev_l - l), (h - prev_h).clip(lower=0), 0.0)
+    dm_minus = np.where((prev_l - l) > (h - prev_h), (prev_l - l).clip(lower=0), 0.0)
+
+    tr_s = pd.Series(tr).ewm(com=period - 1, min_periods=period).mean()
+    dp_s = pd.Series(dm_plus, index=h.index).ewm(com=period - 1, min_periods=period).mean()
+    dm_s = pd.Series(dm_minus, index=h.index).ewm(com=period - 1, min_periods=period).mean()
+
+    di_plus = 100 * dp_s / tr_s.replace(0, np.nan)
+    di_minus = 100 * dm_s / tr_s.replace(0, np.nan)
+    dx = 100 * (di_plus - di_minus).abs() / (di_plus + di_minus).replace(0, np.nan)
+    adx = dx.ewm(com=period - 1, min_periods=period).mean()
+    return adx, di_plus, di_minus
+
+
+def _vwap(df: pd.DataFrame) -> pd.Series:
+    """Intraday VWAP that resets each calendar day."""
+    close = df["close"].astype(float)
+    vol = df["volume"].astype(float)
+    typical = (df["high"].astype(float) + df["low"].astype(float) + close) / 3
+    tpv = typical * vol
+
+    if "datetime" in df.columns:
+        dt = pd.to_datetime(df["datetime"])
+        date_key = dt.dt.date
+    else:
+        date_key = pd.Series(range(len(df)), index=df.index)
+
+    vwap = pd.Series(np.nan, index=df.index)
+    for _, grp in df.groupby(date_key, sort=False):
+        idx = grp.index
+        cum_vol = vol.loc[idx].cumsum()
+        cum_tpv = tpv.loc[idx].cumsum()
+        vwap.loc[idx] = cum_tpv / cum_vol.replace(0, np.nan)
+    return vwap
+
+
+# ---------------------------------------------------------------------------
+# Candlestick pattern detection (60+ patterns)
+# ---------------------------------------------------------------------------
+
+def _add_candlestick_patterns(
+    df: pd.DataFrame,
+    o: pd.Series,
+    h: pd.Series,
+    l: pd.Series,
+    c: pd.Series,
+) -> pd.DataFrame:
+    body = _body(o, c)
+    avg_body = body.rolling(10).mean()
+    upper = _upper_shadow(o, h, c)
+    lower = _lower_shadow(o, l, c)
+    rng = _candle_range(h, l)
+    bull = _bull(o, c)
+    bear = _bear(o, c)
+
+    # -- Single-bar patterns ------------------------------------------------
+
+    # Doji: body <= 10% of range
+    df["pat_doji"] = (body <= 0.1 * rng.replace(0, np.nan)).astype(int)
+
+    # Long-legged doji
+    df["pat_long_legged_doji"] = (
+        (body <= 0.1 * rng.replace(0, np.nan))
+        & (upper >= 0.3 * rng)
+        & (lower >= 0.3 * rng)
+    ).astype(int)
+
+    # Dragonfly doji
+    df["pat_dragonfly_doji"] = (
+        (body <= 0.05 * rng.replace(0, np.nan)) & (upper <= 0.05 * rng) & (lower >= 0.6 * rng)
+    ).astype(int)
+
+    # Gravestone doji
+    df["pat_gravestone_doji"] = (
+        (body <= 0.05 * rng.replace(0, np.nan)) & (lower <= 0.05 * rng) & (upper >= 0.6 * rng)
+    ).astype(int)
+
+    # Hammer (bullish reversal): small body at top, long lower shadow
+    df["pat_hammer"] = (
+        (body >= 0.1 * rng.replace(0, np.nan))
+        & (lower >= 2 * body)
+        & (upper <= 0.1 * rng)
+    ).astype(int)
+
+    # Inverted hammer
+    df["pat_inverted_hammer"] = (
+        (body >= 0.1 * rng.replace(0, np.nan))
+        & (upper >= 2 * body)
+        & (lower <= 0.1 * rng)
+    ).astype(int)
+
+    # Hanging man (same shape as hammer but after uptrend — simplified)
+    df["pat_hanging_man"] = df["pat_hammer"]
+
+    # Shooting star (same shape as inverted hammer but after uptrend)
+    df["pat_shooting_star"] = (
+        bear & (body >= 0.1 * rng.replace(0, np.nan)) & (upper >= 2 * body) & (lower <= 0.1 * rng)
+    ).astype(int)
+
+    # Marubozu (large body, almost no shadows)
+    df["pat_marubozu_bull"] = (bull & (body >= 0.9 * rng.replace(0, np.nan))).astype(int)
+    df["pat_marubozu_bear"] = (bear & (body >= 0.9 * rng.replace(0, np.nan))).astype(int)
+
+    # Spinning top: small body, shadows both sides
+    df["pat_spinning_top"] = (
+        (body < 0.3 * rng.replace(0, np.nan)) & (upper >= 0.2 * rng) & (lower >= 0.2 * rng)
+    ).astype(int)
+
+    # Large candle (body > 1.5x average)
+    df["pat_large_bull"] = (bull & (body > 1.5 * avg_body.replace(0, np.nan))).astype(int)
+    df["pat_large_bear"] = (bear & (body > 1.5 * avg_body.replace(0, np.nan))).astype(int)
+
+    # -- Two-bar patterns ---------------------------------------------------
+
+    o1 = o.shift(1)
+    c1 = c.shift(1)
+    h1 = h.shift(1)
+    l1 = l.shift(1)
+    body1 = _body(o1, c1)
+    bull1 = _bull(o1, c1)
+    bear1 = _bear(o1, c1)
+    rng1 = _candle_range(h1, l1)
+
+    # Bullish engulfing
+    df["pat_bull_engulfing"] = (
+        bear1 & bull & (o <= c1) & (c >= o1)
+    ).astype(int)
+
+    # Bearish engulfing
+    df["pat_bear_engulfing"] = (
+        bull1 & bear & (o >= c1) & (c <= o1)
+    ).astype(int)
+
+    # Bullish harami
+    df["pat_bull_harami"] = (
+        bear1 & bull & (o >= c1) & (c <= o1) & (body < body1)
+    ).astype(int)
+
+    # Bearish harami
+    df["pat_bear_harami"] = (
+        bull1 & bear & (o <= c1) & (c >= o1) & (body < body1)
+    ).astype(int)
+
+    # Piercing line
+    df["pat_piercing"] = (
+        bear1
+        & bull
+        & (o < l1)
+        & (c > (o1 + c1) / 2)
+        & (c < o1)
+    ).astype(int)
+
+    # Dark cloud cover
+    df["pat_dark_cloud"] = (
+        bull1
+        & bear
+        & (o > h1)
+        & (c < (o1 + c1) / 2)
+        & (c > o1)
+    ).astype(int)
+
+    # Tweezer top
+    df["pat_tweezer_top"] = (bull1 & bear & (h.round(2) == h1.round(2))).astype(int)
+
+    # Tweezer bottom
+    df["pat_tweezer_bottom"] = (bear1 & bull & (l.round(2) == l1.round(2))).astype(int)
+
+    # Inside bar
+    df["pat_inside_bar"] = ((h <= h1) & (l >= l1)).astype(int)
+
+    # Outside bar
+    df["pat_outside_bar"] = ((h >= h1) & (l <= l1)).astype(int)
+
+    # Gap up / gap down
+    df["pat_gap_up"] = (o > h1).astype(int)
+    df["pat_gap_down"] = (o < l1).astype(int)
+
+    # Kicker up (gap-up bullish after bearish)
+    df["pat_kicker_up"] = (bear1 & bull & (o >= c1)).astype(int)
+
+    # Kicker down (gap-down bearish after bullish)
+    df["pat_kicker_down"] = (bull1 & bear & (o <= c1)).astype(int)
+
+    # -- Three-bar patterns --------------------------------------------------
+
+    o2 = o.shift(2)
+    c2 = c.shift(2)
+    h2 = h.shift(2)
+    l2 = l.shift(2)
+    bull2 = _bull(o2, c2)
+    bear2 = _bear(o2, c2)
+    body2 = _body(o2, c2)
+
+    # Morning star
+    df["pat_morning_star"] = (
+        bear2
+        & (_body(o1, c1) < 0.3 * body2)
+        & bull
+        & (c > (o2 + c2) / 2)
+    ).astype(int)
+
+    # Evening star
+    df["pat_evening_star"] = (
+        bull2
+        & (_body(o1, c1) < 0.3 * body2)
+        & bear
+        & (c < (o2 + c2) / 2)
+    ).astype(int)
+
+    # Three white soldiers
+    df["pat_three_white_soldiers"] = (
+        bull2 & bull1 & bull & (c > c1) & (c1 > c2) & (o > o1) & (o1 > o2)
+    ).astype(int)
+
+    # Three black crows
+    df["pat_three_black_crows"] = (
+        bear2 & bear1 & bear & (c < c1) & (c1 < c2) & (o < o1) & (o1 < o2)
+    ).astype(int)
+
+    # Three inside up
+    df["pat_three_inside_up"] = (
+        bear2 & bull1 & (o1 >= c2) & (c1 <= o2) & bull & (c > c1)
+    ).astype(int)
+
+    # Three inside down
+    df["pat_three_inside_down"] = (
+        bull2 & bear1 & (o1 <= c2) & (c1 >= o2) & bear & (c < c1)
+    ).astype(int)
+
+    # Three outside up
+    df["pat_three_outside_up"] = (
+        bear2
+        & bull1
+        & (o1 <= c2)
+        & (c1 >= o2)
+        & bull
+        & (c > c1)
+    ).astype(int)
+
+    # Three outside down
+    df["pat_three_outside_down"] = (
+        bull2
+        & bear1
+        & (o1 >= c2)
+        & (c1 <= o2)
+        & bear
+        & (c < c1)
+    ).astype(int)
+
+    # Rising three methods (simplified)
+    df["pat_rising_three"] = (
+        bull2
+        & (body1 < 0.5 * body2)
+        & bull
+        & (c > c2)
+    ).astype(int)
+
+    # Falling three methods (simplified)
+    df["pat_falling_three"] = (
+        bear2
+        & (body1 < 0.5 * body2)
+        & bear
+        & (c < c2)
+    ).astype(int)
+
+    # Abandoned baby bull
+    df["pat_abandoned_baby_bull"] = (
+        bear2
+        & (h1 < l2)
+        & (_body(o1, c1) < 0.05 * rng1.replace(0, np.nan))
+        & bull
+        & (l > h1)
+    ).astype(int)
+
+    # Abandoned baby bear
+    df["pat_abandoned_baby_bear"] = (
+        bull2
+        & (l1 > h2)
+        & (_body(o1, c1) < 0.05 * rng1.replace(0, np.nan))
+        & bear
+        & (h < l1)
+    ).astype(int)
+
+    # Deliberation pattern (bull)
+    df["pat_deliberation_bull"] = (
+        bull2 & bull1 & bull & (body < body1 * 0.5) & (c > c1)
+    ).astype(int)
+
+    # Stalled pattern (bear)
+    df["pat_stalled_bear"] = (
+        bear2 & bear1 & bear & (body < body1 * 0.5) & (c < c1)
+    ).astype(int)
+
+    # -- Additional single patterns -------------------------------------------
+
+    # Long upper shadow (potential reversal signal)
+    df["pat_long_upper_shadow"] = (upper >= 2 * body.replace(0, np.nan)).astype(int)
+
+    # Long lower shadow
+    df["pat_long_lower_shadow"] = (lower >= 2 * body.replace(0, np.nan)).astype(int)
+
+    # High wave candle
+    df["pat_high_wave"] = (
+        (upper >= body.replace(0, np.nan)) & (lower >= body.replace(0, np.nan))
+    ).astype(int)
+
+    # Belt hold bull (opens at low, big bull body)
+    df["pat_belt_hold_bull"] = (
+        bull & (lower <= 0.05 * rng.replace(0, np.nan)) & (body >= 0.7 * rng.replace(0, np.nan))
+    ).astype(int)
+
+    # Belt hold bear (opens at high, big bear body)
+    df["pat_belt_hold_bear"] = (
+        bear & (upper <= 0.05 * rng.replace(0, np.nan)) & (body >= 0.7 * rng.replace(0, np.nan))
+    ).astype(int)
+
+    # Tasuki gap up
+    df["pat_tasuki_gap_up"] = (
+        bull1 & bull & (o < c1) & (c < c1) & (o > l1)
+    ).astype(int)
+
+    # Tasuki gap down
+    df["pat_tasuki_gap_down"] = (
+        bear1 & bear & (o > c1) & (c > c1) & (o < h1)
+    ).astype(int)
+
+    # Stick sandwich bull
+    df["pat_stick_sandwich_bull"] = (
+        bear2 & bull1 & bear & (c.round(2) == c2.round(2))
+    ).astype(int)
+
+    # Matching low
+    df["pat_matching_low"] = (
+        bear1 & bear & (c.round(2) == c1.round(2))
+    ).astype(int)
+
+    # Matching high
+    df["pat_matching_high"] = (
+        bull1 & bull & (c.round(2) == c1.round(2))
+    ).astype(int)
+
+    # Unique three river bottom
+    df["pat_unique_three_river"] = (
+        bear2 & bear1 & bull & (l1 < l2) & (c > c1) & (c < o2)
+    ).astype(int)
+
+    # Two crows
+    df["pat_two_crows"] = (
+        bull2 & bear1 & (o1 > c2) & bear & (o >= o1) & (c > c2) & (c < o1)
+    ).astype(int)
+
+    # On neck
+    df["pat_on_neck"] = (
+        bear1 & bull & (o < l1) & (c.round(2) == l1.round(2))
+    ).astype(int)
+
+    # In neck
+    df["pat_in_neck"] = (
+        bear1 & bull & (o < l1) & (c > l1) & (c < c1 + 0.001 * c1)
+    ).astype(int)
+
+    # Thrusting
+    df["pat_thrusting"] = (
+        bear1 & bull & (o < l1) & (c > l1) & (c < (o1 + c1) / 2)
+    ).astype(int)
+
+    # Counterattack bull
+    df["pat_counterattack_bull"] = (
+        bear1 & bull & (c.round(2) == c1.round(2))
+    ).astype(int)
+
+    # Counterattack bear
+    df["pat_counterattack_bear"] = (
+        bull1 & bear & (c.round(2) == c1.round(2))
+    ).astype(int)
+
+    # Separating lines bull
+    df["pat_separating_bull"] = (
+        bear1 & bull & (o.round(2) == o1.round(2))
+    ).astype(int)
+
+    # Separating lines bear
+    df["pat_separating_bear"] = (
+        bull1 & bear & (o.round(2) == o1.round(2))
+    ).astype(int)
+
+    # Ladder bottom
+    df["pat_ladder_bottom"] = (
+        bear2 & bear1 & bull & (c > o1) & (upper >= 0.3 * rng1.replace(0, np.nan))
+    ).astype(int)
+
+    # -- Composite trend indicators (pattern-based) --------------------------
+    df["pat_bull_signal"] = (
+        df["pat_bull_engulfing"]
+        | df["pat_hammer"]
+        | df["pat_morning_star"]
+        | df["pat_three_white_soldiers"]
+        | df["pat_piercing"]
+        | df["pat_kicker_up"]
+        | df["pat_bull_harami"]
+        | df["pat_dragonfly_doji"]
+        | df["pat_abandoned_baby_bull"]
+    ).astype(int)
+
+    df["pat_bear_signal"] = (
+        df["pat_bear_engulfing"]
+        | df["pat_shooting_star"]
+        | df["pat_evening_star"]
+        | df["pat_three_black_crows"]
+        | df["pat_dark_cloud"]
+        | df["pat_kicker_down"]
+        | df["pat_bear_harami"]
+        | df["pat_gravestone_doji"]
+        | df["pat_abandoned_baby_bear"]
+    ).astype(int)
+
+    return df
