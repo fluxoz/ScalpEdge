@@ -98,6 +98,165 @@ class TestDataManager:
         assert len(loaded) == len(synthetic_df)
         assert set(loaded.columns) == set(synthetic_df.columns)
 
+    def test_custom_interval_accepted(self, tmp_path):
+        """DataManager should accept any supported interval string."""
+        from scalpedge.data import DataManager
+
+        for interval in ("1m", "5m", "15m", "1h", "1d"):
+            dm = DataManager(data_dir=tmp_path, interval=interval)
+            assert dm.interval == interval
+
+    def test_invalid_interval_raises(self, tmp_path):
+        """DataManager should raise ValueError for unsupported intervals."""
+        from scalpedge.data import DataManager
+
+        with pytest.raises(ValueError, match="Unsupported interval"):
+            DataManager(data_dir=tmp_path, interval="99x")
+
+    def test_load_filters_by_start_end(self, synthetic_df, tmp_path):
+        """load() should honour start/end date filters against stored data."""
+        from scalpedge.data import DataManager
+
+        dm = DataManager(data_dir=tmp_path, interval="5m")
+        path = tmp_path / "TEST_5m.parquet"
+        dm._save_parquet(synthetic_df, path)
+
+        # Use a narrow date window in the middle of the synthetic data.
+        start_ts = synthetic_df["datetime"].quantile(0.25)
+        end_ts = synthetic_df["datetime"].quantile(0.75)
+        start_str = start_ts.strftime("%Y-%m-%d")
+        end_str = end_ts.strftime("%Y-%m-%d")
+
+        # Mock _fetch_new_bars to return None (simulate up-to-date cache).
+        original = dm._fetch_new_bars
+        dm._fetch_new_bars = lambda *a, **kw: None
+        result = dm.load("TEST", start=start_str, end=end_str)
+        dm._fetch_new_bars = original
+
+        assert len(result) < len(synthetic_df)
+        assert result["datetime"].min() >= pd.Timestamp(start_str, tz="UTC")
+        assert result["datetime"].max() < pd.Timestamp(end_str, tz="UTC") + pd.Timedelta(days=1)
+
+    def test_parquet_filename_includes_interval(self, synthetic_df, tmp_path):
+        """Parquet files should be named <TICKER>_<INTERVAL>.parquet."""
+        from scalpedge.data import DataManager
+
+        dm = DataManager(data_dir=tmp_path, interval="1d")
+        dm._fetch_new_bars = lambda *a, **kw: None  # skip network call
+        dm._save_parquet(synthetic_df, tmp_path / "TEST_1d.parquet")
+
+        assert (tmp_path / "TEST_1d.parquet").exists()
+
+
+# ---------------------------------------------------------------------------
+# CLI fetch sub-command
+# ---------------------------------------------------------------------------
+
+class TestCLIFetch:
+    """Tests for the 'fetch' sub-command in main.py."""
+
+    def _make_dm(self, synthetic_df, tmp_path, monkeypatch):
+        """Patch DataManager.load to return synthetic data without network."""
+        from unittest.mock import MagicMock
+
+        mock_dm = MagicMock()
+        mock_dm.load.return_value = synthetic_df
+
+        import main as main_module
+        monkeypatch.setattr(
+            main_module,
+            "cmd_fetch",
+            lambda args: print(
+                f"{args.tickers[0].upper()}: {len(synthetic_df):,} bars"
+            ),
+        )
+        return mock_dm
+
+    def test_fetch_help_exits_cleanly(self):
+        """scalpedge fetch --help should exit with code 0."""
+        import argparse
+
+        with pytest.raises(SystemExit) as exc_info:
+            parser = argparse.ArgumentParser()
+            sub = parser.add_subparsers(dest="command")
+            fp = sub.add_parser("fetch")
+            fp.add_argument("tickers", nargs="+")
+            fp.add_argument("--interval", default="5m")
+            fp.add_argument("--start", default=None)
+            fp.add_argument("--end", default=None)
+            fp.add_argument("--output-dir", default=None)
+            fp.parse_args(["--help"])
+        assert exc_info.value.code == 0
+
+    def test_cmd_fetch_success(self, synthetic_df, tmp_path, monkeypatch, capsys):
+        """cmd_fetch prints a summary line per ticker on success."""
+        import argparse
+        import main as main_module
+        from unittest.mock import MagicMock, patch
+
+        mock_dm_instance = MagicMock()
+        mock_dm_instance.load.return_value = synthetic_df
+
+        with patch("scalpedge.data.DataManager", return_value=mock_dm_instance):
+            args = argparse.Namespace(
+                tickers=["TEST"],
+                interval="5m",
+                start=None,
+                end=None,
+                output_dir=None,
+            )
+            main_module.cmd_fetch(args)
+
+        captured = capsys.readouterr()
+        assert "TEST" in captured.out
+        assert "bars" in captured.out
+
+    def test_cmd_fetch_multiple_tickers(self, synthetic_df, tmp_path, capsys):
+        """cmd_fetch handles multiple tickers in one call."""
+        import argparse
+        import main as main_module
+        from unittest.mock import MagicMock, patch
+
+        mock_dm_instance = MagicMock()
+        mock_dm_instance.load.return_value = synthetic_df
+
+        with patch("scalpedge.data.DataManager", return_value=mock_dm_instance):
+            args = argparse.Namespace(
+                tickers=["SPY", "TSLA", "AAPL"],
+                interval="1d",
+                start="2023-01-01",
+                end="2023-12-31",
+                output_dir=str(tmp_path),
+            )
+            main_module.cmd_fetch(args)
+
+        captured = capsys.readouterr()
+        assert "SPY" in captured.out
+        assert "TSLA" in captured.out
+        assert "AAPL" in captured.out
+
+    def test_cmd_fetch_error_exits_nonzero(self, monkeypatch, capsys):
+        """cmd_fetch exits with code 1 when a ticker fails to fetch."""
+        import argparse
+        import main as main_module
+        from unittest.mock import MagicMock, patch
+
+        mock_dm_instance = MagicMock()
+        mock_dm_instance.load.side_effect = ValueError("No data available for BAD")
+
+        with patch("scalpedge.data.DataManager", return_value=mock_dm_instance):
+            args = argparse.Namespace(
+                tickers=["BAD"],
+                interval="5m",
+                start=None,
+                end=None,
+                output_dir=None,
+            )
+            with pytest.raises(SystemExit) as exc_info:
+                main_module.cmd_fetch(args)
+
+        assert exc_info.value.code == 1
+
 
 # ---------------------------------------------------------------------------
 # TA indicators
