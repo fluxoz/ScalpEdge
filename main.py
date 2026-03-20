@@ -21,6 +21,23 @@ import logging
 import sys
 import warnings
 
+# ---------------------------------------------------------------------------
+# Early sanity check — catch corrupted numpy *before* anything else imports
+# ---------------------------------------------------------------------------
+try:
+    import numpy  # noqa: F401
+except ImportError as exc:
+    if "source directory" in str(exc):
+        print(
+            "\n❌  numpy import failed — the virtual environment appears corrupted.\n"
+            "   This commonly happens when the Python interpreter changes (e.g.\n"
+            "   entering a Nix devshell after the venv was already created).\n\n"
+            "   Fix:  rm -rf .venv && uv sync && uv run python main.py\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    raise
+
 warnings.filterwarnings("ignore")
 
 logging.basicConfig(
