@@ -7,6 +7,26 @@ import pandas as pd
 import pytest
 
 
+def _has_pkg(name: str) -> bool:
+    try:
+        __import__(name)
+        return True
+    except ImportError:
+        return False
+
+
+_skip_no_sklearn = pytest.mark.skipif(
+    not _has_pkg("sklearn"), reason="scikit-learn not installed"
+)
+_skip_no_torch = pytest.mark.skipif(
+    not _has_pkg("torch"), reason="torch not installed"
+)
+_skip_no_ml = pytest.mark.skipif(
+    not (_has_pkg("sklearn") and _has_pkg("torch")),
+    reason="scikit-learn and/or torch not installed",
+)
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -259,6 +279,7 @@ class TestMarkovChain:
 # ---------------------------------------------------------------------------
 
 class TestMLModels:
+    @_skip_no_sklearn
     def test_rf_fit_predict(self, clean_df):
         from scalpedge.ml import RandomForestModel
 
@@ -275,6 +296,7 @@ class TestMLModels:
         proba = rf.predict_proba(clean_df)
         assert np.all(proba == 0.5)
 
+    @_skip_no_ml
     def test_lstm_fit_predict(self, clean_df):
         from scalpedge.ml import LSTMModel
 
@@ -284,6 +306,7 @@ class TestMLModels:
         assert proba.shape == (len(clean_df),)
         assert np.all((proba >= 0) & (proba <= 1))
 
+    @_skip_no_ml
     def test_ml_engine_score(self, clean_df):
         from scalpedge.ml import MLEngine
 
@@ -371,6 +394,7 @@ class TestStrategies:
         assert len(signals) == len(clean_df)
         assert signals.isin([0, 1]).all()
 
+    @_skip_no_ml
     def test_hybrid_with_ml(self, clean_df):
         from scalpedge.strategies import HybridStrategy
 

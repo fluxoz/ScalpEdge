@@ -74,7 +74,11 @@ class RandomForestModel:
 
     def fit(self, df: pd.DataFrame) -> "RandomForestModel":
         """Fit on TA-enriched DataFrame."""
-        from sklearn.ensemble import RandomForestClassifier
+        try:
+            from sklearn.ensemble import RandomForestClassifier
+        except ImportError:
+            logger.error("scikit-learn not installed — RandomForest will return 0.5.")
+            return self
 
         X = _make_features(df)
         y = _make_labels(df["close"], self.n_bars_ahead)
@@ -179,7 +183,11 @@ class LSTMModel:
             logger.error("PyTorch not installed — LSTM will return 0.5.")
             return self
 
-        from sklearn.preprocessing import StandardScaler
+        try:
+            from sklearn.preprocessing import StandardScaler
+        except ImportError:
+            logger.error("scikit-learn not installed — LSTM will return 0.5.")
+            return self
 
         X_df = _make_features(df)
         y = _make_labels(df["close"], self.n_bars_ahead)

@@ -6,7 +6,7 @@ using the hybrid strategy that combines:
   * Markov chain order-2 direction probability
   * Monte Carlo random-walk probability
   * Black-Scholes 0DTE delta filter
-  * RandomForest + LSTM ML score
+  * RandomForest + LSTM ML score  (requires ``pip install scalpedge[ml]``)
 
 Usage
 -----
@@ -31,6 +31,16 @@ logging.basicConfig(
 logger = logging.getLogger("scalpedge.main")
 
 # ---------------------------------------------------------------------------
+# Detect optional ML dependencies
+# ---------------------------------------------------------------------------
+import importlib.util
+
+_HAS_ML = (
+    importlib.util.find_spec("sklearn") is not None
+    and importlib.util.find_spec("torch") is not None
+)
+
+# ---------------------------------------------------------------------------
 # Tickers to backtest — add any ticker here to extend coverage.
 # ---------------------------------------------------------------------------
 TICKERS: list[str] = ["SPY", "TSLA"]
@@ -48,7 +58,7 @@ HYBRID_CONFIG = dict(
     bs_min_delta=0.40,
     bs_sigma=0.20,
     hold_bars=3,        # 15 minutes at 5m bars
-    use_ml=True,
+    use_ml=_HAS_ML,
     use_markov=True,
     use_mc=True,
     use_bs=True,
@@ -164,6 +174,11 @@ def _plot_equity(result, ticker: str) -> None:
 def main() -> None:
     logger.info("ScalpEdge backtester starting ...")
     logger.info("Tickers: %s", ", ".join(TICKERS))
+    if not _HAS_ML:
+        logger.info(
+            "ML layer disabled (torch/scikit-learn not installed). "
+            "Install with: uv sync --extra ml  or  pip install -e '.[ml]'"
+        )
 
     results = {}
     for ticker in TICKERS:
