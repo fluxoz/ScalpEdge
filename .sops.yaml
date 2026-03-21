@@ -1,0 +1,8 @@
+keys: 
+  - &tower age1e0jds208hmjq2860q7rdcuam88ge863sz8lgeqsxxkn4v2520u9scdps63
+  - &allowed_keys
+    - *tower
+
+creation_rules:
+  - path_regex: 'secrets/*'
+    age: *allowed_keys
