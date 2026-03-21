@@ -14,6 +14,12 @@ import yfinance as yf
 
 logger = logging.getLogger(__name__)
 
+# Detect the yfinance parameter name for disabling multi-level column headers.
+# The parameter was named 'multi_level_column' in 0.2.x and renamed to
+# 'multi_level_index' in 1.0+.
+_yf_major = int(yf.__version__.split(".")[0])
+_MULTI_LEVEL_KWARG = "multi_level_index" if _yf_major >= 1 else "multi_level_column"
+
 _DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 _INTERVAL = "5m"
 # yfinance free tier returns at most ~60 days of 5-minute history in one pull.
@@ -231,7 +237,7 @@ class DataManager:
                 interval=self.interval,
                 progress=False,
                 auto_adjust=True,
-                multi_level_column=False,
+                **{_MULTI_LEVEL_KWARG: False},
             )
         except Exception as exc:
             logger.warning("yfinance download failed for %s: %s", ticker, exc)

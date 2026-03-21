@@ -42,8 +42,15 @@ except ImportError as exc:
             "   Fix:  rm -rf .venv && uv sync && uv run python main.py\n",
             file=sys.stderr,
         )
-        sys.exit(1)
-    raise
+    else:
+        print(
+            f"\n❌  numpy import failed: {exc}\n"
+            "   Dependencies are not installed in the current Python environment.\n\n"
+            "   Fix:  uv sync && uv run python main.py\n"
+            "    or:  pip install -e .\n",
+            file=sys.stderr,
+        )
+    sys.exit(1)
 
 warnings.filterwarnings("ignore")
 
