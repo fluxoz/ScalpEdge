@@ -17,6 +17,7 @@ Usage
     uv run python main.py fetch SPY TSLA
     uv run python main.py fetch AAPL --interval 1d --start 2023-01-01 --end 2023-12-31
     uv run python main.py fetch SPY --output-dir /tmp/mydata
+    uv run python main.py fetch SPY --years 10          # ~10 years of 5-min bars (chunked)
 
 The ``data/`` directory is auto-created and grows on every run.
 """
@@ -107,6 +108,17 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     """Fetch and persist historical OHLCV data for one or more tickers."""
     from scalpedge.data import DataManager
 
+    # --years is a convenience alias for --start N years ago.
+    start = args.start
+    if getattr(args, "years", None) and start is None:
+        import pandas as pd
+
+        start = (
+            (pd.Timestamp.now(tz="UTC") - pd.DateOffset(years=int(args.years)))
+            .normalize()
+            .strftime("%Y-%m-%d")
+        )
+
     dm = DataManager(
         data_dir=args.output_dir or None,
         interval=args.interval,
@@ -116,7 +128,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     for raw_ticker in args.tickers:
         ticker = raw_ticker.upper()
         try:
-            df = dm.load(ticker, start=args.start, end=args.end)
+            df = dm.load(ticker, start=start, end=args.end)
             first_dt = df["datetime"].min()
             last_dt = df["datetime"].max()
             print(
@@ -259,6 +271,16 @@ def main() -> None:
         help=(
             "Bar interval (default: 5m). "
             "Supported: 1m 2m 5m 15m 30m 60m 90m 1h 1d 5d 1wk 1mo 3mo."
+        ),
+    )
+    fetch_parser.add_argument(
+        "--years",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Convenience shorthand: fetch the last N years of data "
+            "(e.g. --years 10). Ignored when --start is also provided."
         ),
     )
     fetch_parser.add_argument(

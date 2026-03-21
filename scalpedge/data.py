@@ -7,6 +7,7 @@ the ``data/`` directory so the dataset grows incrementally on every run.
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 
 import pandas as pd
@@ -196,6 +197,11 @@ class DataManager:
     ) -> pd.DataFrame | None:
         """Download bars that are not yet in *existing*.
 
+        For intraday intervals whose per-request window is shorter than the
+        requested range (e.g. 5-minute data spans at most 59 days per call),
+        the range is split into consecutive chunks and concatenated.  This
+        allows fetching years of intraday history transparently.
+
         Parameters
         ----------
         ticker:
@@ -225,10 +231,36 @@ class DataManager:
                 return None  # Already up-to-date.
 
         if end is not None:
-            fetch_end = (pd.Timestamp(end, tz="UTC") + pd.Timedelta(days=1))
+            fetch_end = pd.Timestamp(end, tz="UTC") + pd.Timedelta(days=1)
         else:
             fetch_end = now_utc + pd.Timedelta(days=1)
 
+        total_days = (fetch_end - fetch_start).days
+
+        if total_days <= max_days:
+            # Single-request path (fast path, no chunking needed).
+            df = self._fetch_single_window(ticker, fetch_start, fetch_end)
+        else:
+            # Multi-chunk path: split the range into max_days-sized windows.
+            df = self._fetch_range_chunked(ticker, fetch_start, fetch_end, max_days)
+
+        if df is None or df.empty:
+            return None
+
+        # When doing an incremental update (no explicit start), keep only
+        # bars that are strictly newer than the last stored bar.
+        if start is None and not existing.empty:
+            last_ts = existing["datetime"].max()
+            df = df[df["datetime"] > last_ts]
+        return df if not df.empty else None
+
+    def _fetch_single_window(
+        self,
+        ticker: str,
+        fetch_start: pd.Timestamp,
+        fetch_end: pd.Timestamp,
+    ) -> pd.DataFrame | None:
+        """Download a single yfinance window and return a normalised DataFrame."""
         try:
             raw = yf.download(
                 ticker,
@@ -245,14 +277,81 @@ class DataManager:
 
         if raw is None or raw.empty:
             return None
+        return self._normalise(raw, ticker)
 
-        df = self._normalise(raw, ticker)
-        # When doing an incremental update (no explicit start), keep only
-        # bars that are strictly newer than the last stored bar.
-        if start is None and not existing.empty:
-            last_ts = existing["datetime"].max()
-            df = df[df["datetime"] > last_ts]
-        return df if not df.empty else None
+    def _fetch_range_chunked(
+        self,
+        ticker: str,
+        fetch_start: pd.Timestamp,
+        fetch_end: pd.Timestamp,
+        max_days: int,
+    ) -> pd.DataFrame | None:
+        """Fetch a large date range by issuing multiple consecutive API calls.
+
+        The range ``[fetch_start, fetch_end)`` is split into windows of at
+        most *max_days* days.  Each chunk is fetched individually and the
+        results are concatenated.  Progress is logged so long-running
+        downloads remain observable.
+
+        Parameters
+        ----------
+        ticker:
+            Ticker symbol.
+        fetch_start:
+            Inclusive UTC start of the overall range.
+        fetch_end:
+            Exclusive UTC end of the overall range.
+        max_days:
+            Maximum number of days per individual API call.
+        """
+        chunks: list[pd.DataFrame] = []
+        chunk_start = fetch_start
+        chunk_delta = pd.Timedelta(days=max_days)
+
+        total_days = (fetch_end - fetch_start).days
+        n_chunks = math.ceil(total_days / max_days)
+        logger.info(
+            "%s: fetching %d days of %s data in %d chunk(s) of ≤%d days ...",
+            ticker,
+            total_days,
+            self.interval,
+            n_chunks,
+            max_days,
+        )
+
+        chunk_num = 0
+        while chunk_start < fetch_end:
+            chunk_end = min(chunk_start + chunk_delta, fetch_end)
+            chunk_num += 1
+            logger.info(
+                "%s: chunk %d/%d  %s → %s",
+                ticker,
+                chunk_num,
+                n_chunks,
+                chunk_start.strftime("%Y-%m-%d"),
+                chunk_end.strftime("%Y-%m-%d"),
+            )
+            chunk_df = self._fetch_single_window(ticker, chunk_start, chunk_end)
+            if chunk_df is not None and not chunk_df.empty:
+                chunks.append(chunk_df)
+            chunk_start = chunk_end
+
+        if not chunks:
+            return None
+
+        combined = (
+            pd.concat(chunks)
+            .drop_duplicates(subset=["datetime"])
+            .sort_values("datetime")
+            .reset_index(drop=True)
+        )
+        logger.info(
+            "%s: chunked fetch complete — %d bars across %d chunk(s)",
+            ticker,
+            len(combined),
+            n_chunks,
+        )
+        return combined
 
     @staticmethod
     def _normalise(raw: pd.DataFrame, ticker: str) -> pd.DataFrame:
