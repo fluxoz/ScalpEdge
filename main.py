@@ -10,13 +10,20 @@ using the hybrid strategy that combines:
 
 Usage
 -----
+    # Run full backtests (default behaviour):
     uv run python main.py
+
+    # Fetch historical data for one or more tickers:
+    uv run python main.py fetch SPY TSLA
+    uv run python main.py fetch AAPL --interval 1d --start 2023-01-01 --end 2023-12-31
+    uv run python main.py fetch SPY --output-dir /tmp/mydata
 
 The ``data/`` directory is auto-created and grows on every run.
 """
 
 from __future__ import annotations
 
+import argparse
 import logging
 import sys
 import warnings
@@ -35,8 +42,15 @@ except ImportError as exc:
             "   Fix:  rm -rf .venv && uv sync && uv run python main.py\n",
             file=sys.stderr,
         )
-        sys.exit(1)
-    raise
+    else:
+        print(
+            f"\n❌  numpy import failed: {exc}\n"
+            "   Dependencies are not installed in the current Python environment.\n\n"
+            "   Fix:  uv sync && uv run python main.py\n"
+            "    or:  pip install -e .\n",
+            file=sys.stderr,
+        )
+    sys.exit(1)
 
 warnings.filterwarnings("ignore")
 
@@ -87,6 +101,36 @@ BACKTEST_CONFIG = dict(
     hold_bars=3,
     initial_capital=100_000.0,
 )
+
+
+def cmd_fetch(args: argparse.Namespace) -> None:
+    """Fetch and persist historical OHLCV data for one or more tickers."""
+    from scalpedge.data import DataManager
+
+    dm = DataManager(
+        data_dir=args.output_dir or None,
+        interval=args.interval,
+    )
+
+    errors: list[str] = []
+    for raw_ticker in args.tickers:
+        ticker = raw_ticker.upper()
+        try:
+            df = dm.load(ticker, start=args.start, end=args.end)
+            first_dt = df["datetime"].min()
+            last_dt = df["datetime"].max()
+            print(
+                f"{ticker}: {len(df):,} bars  |  "
+                f"interval={args.interval}  |  "
+                f"{first_dt.strftime('%Y-%m-%d')} → {last_dt.strftime('%Y-%m-%d')}"
+            )
+        except Exception as exc:
+            logger.error("Failed to fetch %s: %s", ticker, exc)
+            errors.append(ticker)
+
+    if errors:
+        logger.warning("Failed tickers: %s", ", ".join(errors))
+        sys.exit(1)
 
 
 def run_backtest(ticker: str) -> None:
@@ -189,8 +233,82 @@ def _plot_equity(result, ticker: str) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="scalpedge",
+        description="ScalpEdge — intraday scalping backtester and data toolkit.",
+    )
+    subparsers = parser.add_subparsers(dest="command")
+
+    # ------------------------------------------------------------------ #
+    # fetch sub-command                                                    #
+    # ------------------------------------------------------------------ #
+    fetch_parser = subparsers.add_parser(
+        "fetch",
+        help="Download and persist historical OHLCV data for one or more tickers.",
+    )
+    fetch_parser.add_argument(
+        "tickers",
+        nargs="+",
+        metavar="TICKER",
+        help="One or more ticker symbols to fetch (e.g. SPY TSLA AAPL).",
+    )
+    fetch_parser.add_argument(
+        "--interval",
+        default="5m",
+        metavar="INTERVAL",
+        help=(
+            "Bar interval (default: 5m). "
+            "Supported: 1m 2m 5m 15m 30m 60m 90m 1h 1d 5d 1wk 1mo 3mo."
+        ),
+    )
+    fetch_parser.add_argument(
+        "--start",
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="Start date for the historical range (inclusive).",
+    )
+    fetch_parser.add_argument(
+        "--end",
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="End date for the historical range (inclusive). Defaults to today.",
+    )
+    fetch_parser.add_argument(
+        "--output-dir",
+        default=None,
+        metavar="DIR",
+        help="Directory for Parquet files. Defaults to ./data.",
+    )
+
+    # ------------------------------------------------------------------ #
+    # backtest sub-command (or bare invocation)                           #
+    # ------------------------------------------------------------------ #
+    backtest_parser = subparsers.add_parser(
+        "backtest",
+        help="Run full hybrid backtests (default when no sub-command is given).",
+    )
+    backtest_parser.add_argument(
+        "tickers",
+        nargs="*",
+        metavar="TICKER",
+        help=(
+            "Tickers to backtest. Defaults to SPY and TSLA when omitted."
+        ),
+    )
+
+    args = parser.parse_args()
+
+    if args.command == "fetch":
+        cmd_fetch(args)
+        return
+
+    # Default / explicit backtest path.
+    tickers: list[str] = TICKERS
+    if args.command == "backtest" and args.tickers:
+        tickers = [t.upper() for t in args.tickers]
+
     logger.info("ScalpEdge backtester starting ...")
-    logger.info("Tickers: %s", ", ".join(TICKERS))
+    logger.info("Tickers: %s", ", ".join(tickers))
     if not _HAS_ML:
         logger.info(
             "ML layer disabled (torch/scikit-learn not installed). "
@@ -198,7 +316,7 @@ def main() -> None:
         )
 
     results = {}
-    for ticker in TICKERS:
+    for ticker in tickers:
         try:
             run_backtest(ticker)
             results[ticker] = "OK"

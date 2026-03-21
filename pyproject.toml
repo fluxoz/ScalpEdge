@@ -18,6 +18,9 @@ dependencies = [
     "requests>=2.31.0",
 ]
 
+[project.scripts]
+scalpedge = "main:main"
+
 [project.optional-dependencies]
 ml = [
     "scikit-learn>=1.4.0",
