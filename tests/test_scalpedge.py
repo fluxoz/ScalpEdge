@@ -237,6 +237,170 @@ class TestDataManager:
 
 
 # ---------------------------------------------------------------------------
+# PolygonClient
+# ---------------------------------------------------------------------------
+
+class TestPolygonClient:
+    """Unit tests for PolygonClient — all HTTP calls are mocked."""
+
+    def _make_agg_response(self, bars: list[dict], next_url: str | None = None) -> dict:
+        """Build a minimal Polygon aggregates API response."""
+        body: dict = {"status": "OK", "results": bars}
+        if next_url:
+            body["next_url"] = next_url
+        return body
+
+    def _bar(self, ts_ms: int, o=100.0, h=101.0, low=99.0, c=100.5, v=10000) -> dict:
+        return {"t": ts_ms, "o": o, "h": h, "l": low, "c": c, "v": v}
+
+    def test_results_to_df_basic(self):
+        """_results_to_df should produce a properly-typed DataFrame."""
+        from scalpedge.data import PolygonClient
+
+        bars = [self._bar(1_700_000_000_000 + i * 300_000) for i in range(5)]
+        df = PolygonClient._results_to_df(bars, "SPY")
+
+        assert list(df.columns) == ["datetime", "open", "high", "low", "close", "volume", "ticker"]
+        assert len(df) == 5
+        assert df["datetime"].dt.tz is not None  # UTC-aware
+        assert df["ticker"].iloc[0] == "SPY"
+        assert df["datetime"].is_monotonic_increasing
+
+    def test_fetch_aggs_single_page(self, tmp_path):
+        """fetch_aggs should return bars from a single-page response."""
+        from scalpedge.data import PolygonClient
+        from unittest.mock import MagicMock, patch
+
+        client = PolygonClient.__new__(PolygonClient)
+        client._api_key = "test"
+        client._last_call_time = 0.0
+
+        bars = [self._bar(1_700_000_000_000 + i * 300_000) for i in range(3)]
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = self._make_agg_response(bars)
+        mock_resp.raise_for_status.return_value = None
+
+        with patch("scalpedge.data.requests.get", return_value=mock_resp):
+            with patch("scalpedge.data.time.sleep"):  # skip rate-limit sleep
+                df = client.fetch_aggs(
+                    "SPY",
+                    "5m",
+                    pd.Timestamp("2024-01-01", tz="UTC"),
+                    pd.Timestamp("2024-01-02", tz="UTC"),
+                )
+
+        assert len(df) == 3
+        assert set(df.columns) >= {"datetime", "open", "high", "low", "close", "volume"}
+
+    def test_fetch_aggs_pagination(self):
+        """fetch_aggs should follow next_url to collect multiple pages."""
+        from scalpedge.data import PolygonClient
+        from unittest.mock import MagicMock, patch
+
+        client = PolygonClient.__new__(PolygonClient)
+        client._api_key = "test"
+        client._last_call_time = 0.0
+
+        page1_bars = [self._bar(1_700_000_000_000 + i * 300_000) for i in range(3)]
+        page2_bars = [self._bar(1_700_000_000_000 + (i + 3) * 300_000) for i in range(2)]
+
+        next_url = "https://api.polygon.io/v2/aggs/ticker/SPY/range/5/minute/...?cursor=abc"
+        page1_resp = MagicMock()
+        page1_resp.json.return_value = self._make_agg_response(page1_bars, next_url=next_url)
+        page1_resp.raise_for_status.return_value = None
+
+        page2_resp = MagicMock()
+        page2_resp.json.return_value = self._make_agg_response(page2_bars)
+        page2_resp.raise_for_status.return_value = None
+
+        with patch("scalpedge.data.requests.get", side_effect=[page1_resp, page2_resp]):
+            with patch("scalpedge.data.time.sleep"):
+                df = client.fetch_aggs(
+                    "SPY",
+                    "5m",
+                    pd.Timestamp("2024-01-01", tz="UTC"),
+                    pd.Timestamp("2024-01-02", tz="UTC"),
+                )
+
+        assert len(df) == 5  # 3 + 2 bars across two pages
+
+    def test_fetch_aggs_empty_response(self):
+        """fetch_aggs should return an empty DataFrame when no results."""
+        from scalpedge.data import PolygonClient
+        from unittest.mock import MagicMock, patch
+
+        client = PolygonClient.__new__(PolygonClient)
+        client._api_key = "test"
+        client._last_call_time = 0.0
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"status": "OK", "results": []}
+        mock_resp.raise_for_status.return_value = None
+
+        with patch("scalpedge.data.requests.get", return_value=mock_resp):
+            with patch("scalpedge.data.time.sleep"):
+                df = client.fetch_aggs(
+                    "SPY",
+                    "5m",
+                    pd.Timestamp("2024-01-01", tz="UTC"),
+                    pd.Timestamp("2024-01-02", tz="UTC"),
+                )
+
+        assert df.empty
+
+    def test_fetch_aggs_unsupported_interval(self):
+        """fetch_aggs should raise ValueError for unmapped intervals."""
+        from scalpedge.data import PolygonClient
+
+        client = PolygonClient.__new__(PolygonClient)
+        client._api_key = "test"
+        client._last_call_time = 0.0
+
+        with pytest.raises(ValueError, match="not supported by Polygon"):
+            client.fetch_aggs(
+                "SPY",
+                "99x",
+                pd.Timestamp("2024-01-01", tz="UTC"),
+                pd.Timestamp("2024-01-02", tz="UTC"),
+            )
+
+    def test_no_api_key_raises(self, monkeypatch):
+        """PolygonClient should raise ValueError when no API key is available."""
+        from scalpedge.data import PolygonClient
+
+        monkeypatch.delenv("POLYGON_API_KEY", raising=False)
+        with pytest.raises(ValueError, match="POLYGON_API_KEY"):
+            PolygonClient()
+
+    def test_data_manager_uses_polygon_when_key_set(self, tmp_path, monkeypatch, synthetic_df):
+        """DataManager should route to Polygon when POLYGON_API_KEY is set."""
+        from scalpedge.data import DataManager
+
+        monkeypatch.setenv("POLYGON_API_KEY", "fake_key")
+        dm = DataManager(data_dir=tmp_path)
+        assert dm._polygon is not None
+
+        # Verify _fetch_new_bars delegates to _fetch_polygon.
+        polygon_called: list[bool] = []
+
+        def fake_polygon(ticker, start, end):
+            polygon_called.append(True)
+            return synthetic_df.copy()
+
+        dm._fetch_polygon = fake_polygon
+        dm._fetch_new_bars("TEST", pd.DataFrame())
+        assert polygon_called, "_fetch_polygon was not called when Polygon key is set"
+
+    def test_data_manager_falls_back_to_yfinance(self, tmp_path, monkeypatch):
+        """DataManager should use yfinance when POLYGON_API_KEY is absent."""
+        from scalpedge.data import DataManager
+
+        monkeypatch.delenv("POLYGON_API_KEY", raising=False)
+        dm = DataManager(data_dir=tmp_path)
+        assert dm._polygon is None
+
+
+# ---------------------------------------------------------------------------
 # CLI fetch sub-command
 # ---------------------------------------------------------------------------
 
