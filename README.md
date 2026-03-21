@@ -21,6 +21,27 @@ Combines:
 
 ## Setup
 
+### Data Source — Polygon.io (recommended)
+
+ScalpEdge uses **Polygon.io** as the primary market data source.
+Sign up for a free key at <https://polygon.io/> and export it before running:
+
+```bash
+export POLYGON_API_KEY="your_key_here"
+```
+
+Free tier limits observed by the client:
+
+| Limit | Value |
+|---|---|
+| API calls/minute | 5 |
+| Historical minute data | 2 years |
+| Coverage | All US stocks |
+
+> **Fallback** — if `POLYGON_API_KEY` is not set, ScalpEdge falls back to
+> **yfinance** automatically (limited to ~60 days of intraday history per
+> request, auto-chunked for longer ranges).
+
 ### Option A — Nix + uv (recommended, fully reproducible)
 
 ```bash
@@ -68,7 +89,7 @@ ScalpEdge/
 │   └── TSLA.parquet
 └── scalpedge/
     ├── __init__.py
-    ├── data.py              # Data management: fetch, store, auto-append (yfinance + Parquet)
+    ├── data.py              # Data management: fetch, store, auto-append (Polygon/yfinance + Parquet)
     ├── ta_indicators.py     # 20+ TA indicators + 60+ candlestick patterns (vectorized)
     ├── probabilities.py     # Monte Carlo + Markov chain (order-2)
     ├── options.py           # Black-Scholes pricing, Greeks, implied vol
@@ -107,7 +128,7 @@ An equity curve PNG is also saved to `data/<TICKER>_equity_curve.png`.
 Edit `TICKERS` in `main.py`:
 
 ```python
-TICKERS: list[str] = ["SPY", "TSLA", "QQQ", "NVDA", "GC=F"]  # any yfinance symbol
+TICKERS: list[str] = ["SPY", "TSLA", "QQQ", "NVDA"]  # any US stock ticker
 ```
 
 That's it — data management, indicators, and backtest all work automatically.
@@ -153,7 +174,7 @@ strategy = HybridStrategy(extra_rules=[my_rule])
 
 | Layer | Module | What it does |
 |---|---|---|
-| Data | `data.py` | Fetches 5m OHLCV from yfinance, stores in Parquet, auto-appends new bars |
+| Data | `data.py` | Fetches 5m OHLCV from Polygon.io (or yfinance fallback), stores in Parquet, auto-appends new bars |
 | TA | `ta_indicators.py` | EMA/SMA/RSI/MACD/BB/ATR/OBV/VWAP/Stoch/ADX + 60+ candle patterns |
 | Probabilities | `probabilities.py` | Monte Carlo random walk + Markov chain order-2 transition probs |
 | Options | `options.py` | Black-Scholes call/put, delta, gamma, vega, theta, rho, implied vol |
