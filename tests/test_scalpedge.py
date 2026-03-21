@@ -147,6 +147,258 @@ class TestDataManager:
 
         assert (tmp_path / "TEST_1d.parquet").exists()
 
+    def test_fetch_range_chunked_combines_results(self, synthetic_df, tmp_path):
+        """_fetch_range_chunked should combine results from multiple windows."""
+        from scalpedge.data import DataManager
+
+        dm = DataManager(data_dir=tmp_path, interval="5m")
+
+        # Build three non-overlapping chunks of 100 bars each.
+        chunk_size = 100
+        chunk1 = synthetic_df.iloc[:chunk_size].copy()
+        chunk2 = synthetic_df.iloc[chunk_size : chunk_size * 2].copy()
+        chunk3 = synthetic_df.iloc[chunk_size * 2 : chunk_size * 3].copy()
+        chunks_iter = iter([chunk1, chunk2, chunk3])
+
+        def fake_fetch_single(ticker, start, end):
+            try:
+                return next(chunks_iter)
+            except StopIteration:
+                return None
+
+        dm._fetch_single_window = fake_fetch_single
+
+        # Use a range that spans 3× max_days to force 3 chunks.
+        fetch_start = pd.Timestamp("2020-01-01", tz="UTC")
+        fetch_end = fetch_start + pd.Timedelta(days=180)  # 3 × 59-day chunks
+
+        result = dm._fetch_range_chunked(
+            "TEST", fetch_start, fetch_end, max_days=59
+        )
+
+        assert result is not None
+        assert len(result) == chunk_size * 3
+        # Results must be sorted by datetime and duplicate-free.
+        assert result["datetime"].is_monotonic_increasing
+
+    def test_fetch_range_chunked_deduplicates(self, synthetic_df, tmp_path):
+        """_fetch_range_chunked must deduplicate overlapping bars."""
+        from scalpedge.data import DataManager
+
+        dm = DataManager(data_dir=tmp_path, interval="5m")
+
+        overlap_df = synthetic_df.iloc[:200].copy()
+        # Return the same data twice to simulate overlap.
+        calls = [overlap_df, overlap_df]
+        call_iter = iter(calls)
+
+        def fake_fetch_single(ticker, start, end):
+            try:
+                return next(call_iter)
+            except StopIteration:
+                return None
+
+        dm._fetch_single_window = fake_fetch_single
+
+        fetch_start = pd.Timestamp("2020-01-01", tz="UTC")
+        fetch_end = fetch_start + pd.Timedelta(days=120)
+
+        result = dm._fetch_range_chunked("TEST", fetch_start, fetch_end, max_days=59)
+
+        assert result is not None
+        # After deduplication the row count should equal the unique bar count.
+        assert len(result) == result["datetime"].nunique()
+
+    def test_fetch_new_bars_uses_chunking_for_large_range(self, synthetic_df, tmp_path):
+        """_fetch_new_bars should delegate to _fetch_range_chunked for ranges
+        exceeding max_days for the given interval."""
+        from scalpedge.data import DataManager
+
+        dm = DataManager(data_dir=tmp_path, interval="5m")
+
+        chunked_called: list[bool] = []
+
+        def fake_chunked(ticker, start, end, max_days):
+            chunked_called.append(True)
+            return synthetic_df.copy()
+
+        dm._fetch_range_chunked = fake_chunked
+
+        # Request > 59 days — should trigger chunked path.
+        result = dm._fetch_new_bars(
+            "TEST",
+            pd.DataFrame(),
+            start="2015-01-01",
+            end="2025-01-01",
+        )
+
+        assert chunked_called, "_fetch_range_chunked was not called for a large range"
+        assert result is not None
+
+
+# ---------------------------------------------------------------------------
+# PolygonClient
+# ---------------------------------------------------------------------------
+
+class TestPolygonClient:
+    """Unit tests for PolygonClient — all HTTP calls are mocked."""
+
+    def _make_agg_response(self, bars: list[dict], next_url: str | None = None) -> dict:
+        """Build a minimal Polygon aggregates API response."""
+        body: dict = {"status": "OK", "results": bars}
+        if next_url:
+            body["next_url"] = next_url
+        return body
+
+    def _bar(self, ts_ms: int, o=100.0, h=101.0, low=99.0, c=100.5, v=10000) -> dict:
+        return {"t": ts_ms, "o": o, "h": h, "l": low, "c": c, "v": v}
+
+    def test_results_to_df_basic(self):
+        """_results_to_df should produce a properly-typed DataFrame."""
+        from scalpedge.data import PolygonClient
+
+        bars = [self._bar(1_700_000_000_000 + i * 300_000) for i in range(5)]
+        df = PolygonClient._results_to_df(bars, "SPY")
+
+        assert list(df.columns) == ["datetime", "open", "high", "low", "close", "volume", "ticker"]
+        assert len(df) == 5
+        assert df["datetime"].dt.tz is not None  # UTC-aware
+        assert df["ticker"].iloc[0] == "SPY"
+        assert df["datetime"].is_monotonic_increasing
+
+    def test_fetch_aggs_single_page(self, tmp_path):
+        """fetch_aggs should return bars from a single-page response."""
+        from scalpedge.data import PolygonClient
+        from unittest.mock import MagicMock, patch
+
+        client = PolygonClient.__new__(PolygonClient)
+        client._api_key = "test"
+        client._last_call_time = 0.0
+
+        bars = [self._bar(1_700_000_000_000 + i * 300_000) for i in range(3)]
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = self._make_agg_response(bars)
+        mock_resp.raise_for_status.return_value = None
+
+        with patch("scalpedge.data.requests.get", return_value=mock_resp):
+            with patch("scalpedge.data.time.sleep"):  # skip rate-limit sleep
+                df = client.fetch_aggs(
+                    "SPY",
+                    "5m",
+                    pd.Timestamp("2024-01-01", tz="UTC"),
+                    pd.Timestamp("2024-01-02", tz="UTC"),
+                )
+
+        assert len(df) == 3
+        assert set(df.columns) >= {"datetime", "open", "high", "low", "close", "volume"}
+
+    def test_fetch_aggs_pagination(self):
+        """fetch_aggs should follow next_url to collect multiple pages."""
+        from scalpedge.data import PolygonClient
+        from unittest.mock import MagicMock, patch
+
+        client = PolygonClient.__new__(PolygonClient)
+        client._api_key = "test"
+        client._last_call_time = 0.0
+
+        page1_bars = [self._bar(1_700_000_000_000 + i * 300_000) for i in range(3)]
+        page2_bars = [self._bar(1_700_000_000_000 + (i + 3) * 300_000) for i in range(2)]
+
+        next_url = "https://api.polygon.io/v2/aggs/ticker/SPY/range/5/minute/...?cursor=abc"
+        page1_resp = MagicMock()
+        page1_resp.json.return_value = self._make_agg_response(page1_bars, next_url=next_url)
+        page1_resp.raise_for_status.return_value = None
+
+        page2_resp = MagicMock()
+        page2_resp.json.return_value = self._make_agg_response(page2_bars)
+        page2_resp.raise_for_status.return_value = None
+
+        with patch("scalpedge.data.requests.get", side_effect=[page1_resp, page2_resp]):
+            with patch("scalpedge.data.time.sleep"):
+                df = client.fetch_aggs(
+                    "SPY",
+                    "5m",
+                    pd.Timestamp("2024-01-01", tz="UTC"),
+                    pd.Timestamp("2024-01-02", tz="UTC"),
+                )
+
+        assert len(df) == 5  # 3 + 2 bars across two pages
+
+    def test_fetch_aggs_empty_response(self):
+        """fetch_aggs should return an empty DataFrame when no results."""
+        from scalpedge.data import PolygonClient
+        from unittest.mock import MagicMock, patch
+
+        client = PolygonClient.__new__(PolygonClient)
+        client._api_key = "test"
+        client._last_call_time = 0.0
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"status": "OK", "results": []}
+        mock_resp.raise_for_status.return_value = None
+
+        with patch("scalpedge.data.requests.get", return_value=mock_resp):
+            with patch("scalpedge.data.time.sleep"):
+                df = client.fetch_aggs(
+                    "SPY",
+                    "5m",
+                    pd.Timestamp("2024-01-01", tz="UTC"),
+                    pd.Timestamp("2024-01-02", tz="UTC"),
+                )
+
+        assert df.empty
+
+    def test_fetch_aggs_unsupported_interval(self):
+        """fetch_aggs should raise ValueError for unmapped intervals."""
+        from scalpedge.data import PolygonClient
+
+        client = PolygonClient.__new__(PolygonClient)
+        client._api_key = "test"
+        client._last_call_time = 0.0
+
+        with pytest.raises(ValueError, match="not supported by Polygon"):
+            client.fetch_aggs(
+                "SPY",
+                "99x",
+                pd.Timestamp("2024-01-01", tz="UTC"),
+                pd.Timestamp("2024-01-02", tz="UTC"),
+            )
+
+    def test_no_api_key_raises(self, monkeypatch):
+        """PolygonClient should raise ValueError when no API key is available."""
+        from scalpedge.data import PolygonClient
+
+        monkeypatch.delenv("POLYGON_API_KEY", raising=False)
+        with pytest.raises(ValueError, match="POLYGON_API_KEY"):
+            PolygonClient()
+
+    def test_data_manager_uses_polygon_when_key_set(self, tmp_path, monkeypatch, synthetic_df):
+        """DataManager should route to Polygon when POLYGON_API_KEY is set."""
+        from scalpedge.data import DataManager
+
+        monkeypatch.setenv("POLYGON_API_KEY", "fake_key")
+        dm = DataManager(data_dir=tmp_path)
+        assert dm._polygon is not None
+
+        # Verify _fetch_new_bars delegates to _fetch_polygon.
+        polygon_called: list[bool] = []
+
+        def fake_polygon(ticker, start, end):
+            polygon_called.append(True)
+            return synthetic_df.copy()
+
+        dm._fetch_polygon = fake_polygon
+        dm._fetch_new_bars("TEST", pd.DataFrame())
+        assert polygon_called, "_fetch_polygon was not called when Polygon key is set"
+
+    def test_data_manager_falls_back_to_yfinance(self, tmp_path, monkeypatch):
+        """DataManager should use yfinance when POLYGON_API_KEY is absent."""
+        from scalpedge.data import DataManager
+
+        monkeypatch.delenv("POLYGON_API_KEY", raising=False)
+        dm = DataManager(data_dir=tmp_path)
+        assert dm._polygon is None
+
 
 # ---------------------------------------------------------------------------
 # CLI fetch sub-command
@@ -256,6 +508,67 @@ class TestCLIFetch:
                 main_module.cmd_fetch(args)
 
         assert exc_info.value.code == 1
+
+    def test_cmd_fetch_years_sets_start(self, synthetic_df, tmp_path, capsys):
+        """--years N should compute a start date ~N years ago and pass it to load()."""
+        import argparse
+        import datetime
+        import main as main_module
+        from unittest.mock import MagicMock, patch
+
+        mock_dm_instance = MagicMock()
+        captured_start: list[str] = []
+
+        def recording_load(ticker, start=None, end=None):
+            captured_start.append(start)
+            return synthetic_df
+
+        mock_dm_instance.load.side_effect = recording_load
+
+        with patch("scalpedge.data.DataManager", return_value=mock_dm_instance):
+            args = argparse.Namespace(
+                tickers=["SPY"],
+                interval="5m",
+                start=None,
+                end=None,
+                output_dir=None,
+                years=10,
+            )
+            main_module.cmd_fetch(args)
+
+        assert captured_start, "load() was never called"
+        computed_date = datetime.date.fromisoformat(captured_start[0])
+        expected_year = datetime.date.today().year - 10
+        # The computed year should be exactly 10 years ago (within ±1 year for safety).
+        assert abs(computed_date.year - expected_year) <= 1
+
+    def test_cmd_fetch_start_overrides_years(self, synthetic_df, tmp_path, capsys):
+        """When --start is provided, --years should be ignored."""
+        import argparse
+        import main as main_module
+        from unittest.mock import MagicMock, patch
+
+        mock_dm_instance = MagicMock()
+        captured_start: list[str] = []
+
+        def recording_load(ticker, start=None, end=None):
+            captured_start.append(start)
+            return synthetic_df
+
+        mock_dm_instance.load.side_effect = recording_load
+
+        with patch("scalpedge.data.DataManager", return_value=mock_dm_instance):
+            args = argparse.Namespace(
+                tickers=["SPY"],
+                interval="5m",
+                start="2020-01-01",
+                end=None,
+                output_dir=None,
+                years=10,  # should be ignored because start is set
+            )
+            main_module.cmd_fetch(args)
+
+        assert captured_start[0] == "2020-01-01"
 
 
 # ---------------------------------------------------------------------------
