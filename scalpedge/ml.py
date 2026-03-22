@@ -12,6 +12,7 @@ filter in hybrid strategies.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
@@ -60,6 +61,7 @@ class RandomForestModel:
     n_estimators:   Number of trees.
     n_bars_ahead:   Prediction horizon in bars.
     random_state:   Random seed for reproducibility.
+    max_staleness:  Maximum age of model before it is considered stale.
     """
 
     def __init__(
@@ -67,17 +69,23 @@ class RandomForestModel:
         n_estimators: int = 200,
         n_bars_ahead: int = 1,
         random_state: int = 42,
+        max_staleness: timedelta = timedelta(hours=24),
     ) -> None:
         self.n_estimators = n_estimators
         self.n_bars_ahead = n_bars_ahead
         self.random_state = random_state
+        self.max_staleness = max_staleness
         self._model = None
         self._fitted = False
+        self._last_fit_dt: datetime | None = None
+
+    # ------------------------------------------------------------------
 
     def fit(self, df: pd.DataFrame) -> "RandomForestModel":
         """Fit on TA-enriched DataFrame."""
         try:
             from sklearn.ensemble import RandomForestClassifier
+            from sklearn.utils.class_weight import compute_class_weight
         except ImportError:
             logger.error("scikit-learn not installed — RandomForest will return 0.5.")
             return self
@@ -93,16 +101,83 @@ class RandomForestModel:
             logger.warning("Too few samples (%d) to fit RandomForest.", len(X))
             return self
 
+        classes = np.unique(y)
+        weights = compute_class_weight("balanced", classes=classes, y=y)
+        cw = dict(zip(classes, weights))
+
         self._model = RandomForestClassifier(
             n_estimators=self.n_estimators,
             random_state=self.random_state,
             n_jobs=-1,
-            class_weight="balanced",
+            class_weight=cw,
+            warm_start=True,
         )
         self._model.fit(X, y)
         self._feature_cols = list(X.columns)
         self._fitted = True
+        self._last_fit_dt = datetime.now(timezone.utc)
         return self
+
+    def partial_fit(
+        self,
+        df: pd.DataFrame,
+        n_new_trees: int = 50,
+    ) -> "RandomForestModel":
+        """Incrementally add trees trained on new data via ``warm_start``.
+
+        If the model has not been fitted yet, falls back to a full :meth:`fit`.
+        """
+        if not self._fitted or self._model is None:
+            logger.info("No existing RF model — falling back to full fit.")
+            return self.fit(df)
+
+        try:
+            from sklearn.utils.class_weight import compute_class_weight
+        except ImportError:
+            logger.error("scikit-learn not installed — cannot partial-fit.")
+            return self
+
+        X = _make_features(df)
+        y = _make_labels(df["close"], self.n_bars_ahead)
+        mask = y.notna()
+        X, y = X[mask], y[mask]
+
+        if len(X) < 50:
+            logger.warning("Too few samples (%d) to partial-fit RandomForest.", len(X))
+            return self
+
+        # Align features with original training columns.
+        for col in self._feature_cols:
+            if col not in X.columns:
+                X[col] = 0.0
+        X = X[self._feature_cols]
+
+        classes = np.unique(y)
+        weights = compute_class_weight("balanced", classes=classes, y=y)
+        self._model.class_weight = dict(zip(classes, weights))
+
+        # Grow additional trees using warm_start.
+        self._model.n_estimators += n_new_trees
+        self._model.fit(X, y)
+        self._last_fit_dt = datetime.now(timezone.utc)
+        logger.info(
+            "RF partial-fit complete — total trees: %d", self._model.n_estimators
+        )
+        return self
+
+    # ------------------------------------------------------------------
+
+    @property
+    def last_fit_dt(self) -> datetime | None:
+        """UTC timestamp of the last fit/partial-fit, or *None*."""
+        return self._last_fit_dt
+
+    def is_stale(self, now: datetime | None = None) -> bool:
+        """Return *True* if model has never been fitted or exceeds *max_staleness*."""
+        if self._last_fit_dt is None:
+            return True
+        ref = now if now is not None else datetime.now(timezone.utc)
+        return (ref - self._last_fit_dt) > self.max_staleness
 
     def predict_proba(self, df: pd.DataFrame) -> np.ndarray:
         """Return array of P(up) for each row in *df*."""
@@ -147,6 +222,7 @@ class LSTMModel:
     lr:             Learning rate.
     batch_size:     Mini-batch size.
     device:         ``'cpu'`` or ``'cuda'``.
+    max_staleness:  Maximum age of model before it is considered stale.
     """
 
     def __init__(
@@ -159,6 +235,7 @@ class LSTMModel:
         lr: float = 1e-3,
         batch_size: int = 64,
         device: str = "cpu",
+        max_staleness: timedelta = timedelta(hours=24),
     ) -> None:
         self.seq_len = seq_len
         self.hidden_size = hidden_size
@@ -168,10 +245,12 @@ class LSTMModel:
         self.lr = lr
         self.batch_size = batch_size
         self.device_name = device
+        self.max_staleness = max_staleness
         self._net = None
         self._fitted = False
         self._scaler = None
         self._feature_cols: list[str] = []
+        self._last_fit_dt: datetime | None = None
 
     # ------------------------------------------------------------------
 
@@ -242,7 +321,104 @@ class LSTMModel:
         self._net = net
         self._device = device
         self._fitted = True
+        self._last_fit_dt = datetime.now(timezone.utc)
         return self
+
+    def partial_fit(
+        self,
+        df: pd.DataFrame,
+        epochs: int | None = None,
+    ) -> "LSTMModel":
+        """Continue training the existing LSTM on new data.
+
+        If the model has not been fitted yet, falls back to a full :meth:`fit`.
+
+        Parameters
+        ----------
+        df:
+            New indicator-enriched DataFrame to train on.
+        epochs:
+            Number of additional epochs.  Defaults to ``self.epochs``.
+        """
+        if not self._fitted or self._net is None:
+            logger.info("No existing LSTM model — falling back to full fit.")
+            return self.fit(df)
+
+        try:
+            import torch
+            import torch.nn as nn
+            from torch.utils.data import DataLoader, TensorDataset
+        except ImportError:
+            logger.error("PyTorch not installed — LSTM will return 0.5.")
+            return self
+
+        epochs = epochs if epochs is not None else self.epochs
+
+        X_df = _make_features(df)
+        y = _make_labels(df["close"], self.n_bars_ahead)
+        mask = y.notna()
+        X_df, y = X_df[mask], y[mask]
+
+        if len(X_df) < self.seq_len + 10:
+            logger.warning("Too few samples for LSTM partial-fit.")
+            return self
+
+        # Align features.
+        for col in self._feature_cols:
+            if col not in X_df.columns:
+                X_df[col] = 0.0
+        X_df = X_df[self._feature_cols]
+
+        X_scaled = self._scaler.transform(X_df.values.astype(float))
+
+        seqs, labels = [], []
+        for i in range(self.seq_len, len(X_scaled)):
+            seqs.append(X_scaled[i - self.seq_len : i])
+            labels.append(int(y.iloc[i]))
+
+        X_tensor = torch.FloatTensor(np.array(seqs))
+        y_tensor = torch.FloatTensor(labels)
+
+        dataset = TensorDataset(X_tensor, y_tensor)
+        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True, drop_last=False)
+
+        criterion = nn.BCELoss()
+        optim = torch.optim.Adam(self._net.parameters(), lr=self.lr)
+
+        self._net.train()
+        for epoch in range(epochs):
+            total_loss = 0.0
+            for xb, yb in loader:
+                xb, yb = xb.to(self._device), yb.to(self._device)
+                optim.zero_grad()
+                preds = self._net(xb).squeeze()
+                loss = criterion(preds, yb)
+                loss.backward()
+                optim.step()
+                total_loss += loss.item()
+            if (epoch + 1) % 5 == 0:
+                logger.debug(
+                    "LSTM partial-fit epoch %d/%d — loss %.4f", epoch + 1, epochs, total_loss
+                )
+
+        self._net.eval()
+        self._last_fit_dt = datetime.now(timezone.utc)
+        logger.info("LSTM partial-fit complete (%d epochs).", epochs)
+        return self
+
+    # ------------------------------------------------------------------
+
+    @property
+    def last_fit_dt(self) -> datetime | None:
+        """UTC timestamp of the last fit/partial-fit, or *None*."""
+        return self._last_fit_dt
+
+    def is_stale(self, now: datetime | None = None) -> bool:
+        """Return *True* if model has never been fitted or exceeds *max_staleness*."""
+        if self._last_fit_dt is None:
+            return True
+        ref = now if now is not None else datetime.now(timezone.utc)
+        return (ref - self._last_fit_dt) > self.max_staleness
 
     def predict_proba(self, df: pd.DataFrame) -> np.ndarray:
         """Return P(up) for each row. Uses a rolling window of seq_len rows."""
@@ -330,6 +506,39 @@ class MLEngine:
         self._fitted = True
         return self
 
+    def partial_fit(
+        self,
+        df: pd.DataFrame,
+        rf_n_new_trees: int = 50,
+        lstm_epochs: int | None = None,
+    ) -> "MLEngine":
+        """Incrementally retrain both models on new data.
+
+        Parameters
+        ----------
+        df:
+            New indicator-enriched DataFrame.
+        rf_n_new_trees:
+            Number of additional trees to grow in the RF model.
+        lstm_epochs:
+            Number of additional epochs for LSTM.  Defaults to the model's
+            configured epoch count.
+        """
+        logger.info("Partial-fitting RandomForest ...")
+        self.rf.partial_fit(df, n_new_trees=rf_n_new_trees)
+        logger.info("Partial-fitting LSTM ...")
+        self.lstm.partial_fit(df, epochs=lstm_epochs)
+        self._fitted = True
+        return self
+
+    # ------------------------------------------------------------------
+    # Staleness monitoring
+    # ------------------------------------------------------------------
+
+    def is_stale(self, now: datetime | None = None) -> bool:
+        """Return *True* if **either** sub-model is stale."""
+        return self.rf.is_stale(now=now) or self.lstm.is_stale(now=now)
+
     def score(self, df: pd.DataFrame, weights: tuple[float, float] = (0.5, 0.5)) -> pd.Series:
         """Return weighted-average P(up) signal for every row in *df*.
 
@@ -340,6 +549,13 @@ class MLEngine:
         weights:
             (rf_weight, lstm_weight) — must sum to 1.
         """
+        if self.is_stale():
+            logger.warning(
+                "ML model is stale (RF last fit: %s, LSTM last fit: %s). "
+                "Consider calling partial_fit() or fit() with recent data.",
+                self.rf.last_fit_dt,
+                self.lstm.last_fit_dt,
+            )
         w_rf, w_lstm = weights
         rf_prob = self.rf.predict_proba(df)
         lstm_prob = self.lstm.predict_proba(df)
