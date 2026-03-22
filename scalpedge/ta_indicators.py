@@ -1,10 +1,26 @@
 """Technical Analysis indicators module.
 
-Adds EMA, SMA, RSI, MACD, Bollinger Bands, ATR, OBV, VWAP, and 60+
-candlestick pattern columns to a 5-minute OHLCV DataFrame.
+Adds EMA, SMA, RSI, MACD, Bollinger Bands, ATR, OBV, VWAP, Volume Profile /
+POC, and 60+ candlestick pattern columns to a 5-minute OHLCV DataFrame.
 
 All computations are vectorized (pandas / numpy).  ``pandas-ta`` is used
 for the heavy lifting so every indicator is available from one function call.
+
+Volume Profile / POC
+--------------------
+Each session's rolling volume-at-price histogram is accumulated bar-by-bar
+(no look-ahead).  The Point of Control (POC) is the price level with the
+highest cumulative volume.  Four derived signal columns are added:
+
+* ``poc_price``          — POC price level as of each bar (session-rolling).
+* ``poc_proximity_pct``  — (close − POC) / POC × 100  (negative = below POC).
+* ``poc_above``          — 1 when close > POC, else 0.
+* ``poc_below``          — 1 when close < POC, else 0.
+
+Optional visualization
+----------------------
+``plot_volume_profile(df, session_date)`` renders a horizontal volume-profile
+histogram overlaid on the session price chart.  Requires ``matplotlib``.
 """
 
 from __future__ import annotations
@@ -152,6 +168,13 @@ def add_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["price_vs_vwap"] = (c - df["vwap"]) / df["vwap"].replace(0, np.nan) * 100
 
     # -----------------------------------------------------------------------
+    # Volume Profile / Point of Control (POC) — rolling, resets each session
+    # -----------------------------------------------------------------------
+    df["poc_price"], df["poc_proximity_pct"] = _volume_profile(df)
+    df["poc_above"] = (c > df["poc_price"]).astype(int)
+    df["poc_below"] = (c < df["poc_price"]).astype(int)
+
+    # -----------------------------------------------------------------------
     # Candlestick patterns (60+)
     # -----------------------------------------------------------------------
     df = _add_candlestick_patterns(df, o, h, l, c)
@@ -274,6 +297,77 @@ def _vwap(df: pd.DataFrame) -> pd.Series:
         cum_tpv = tpv.loc[idx].cumsum()
         vwap.loc[idx] = cum_tpv / cum_vol.replace(0, np.nan)
     return vwap
+
+
+def _volume_profile(
+    df: pd.DataFrame, n_bins: int = 50
+) -> tuple[pd.Series, pd.Series]:
+    """Compute rolling intraday volume profile and Point of Control (POC).
+
+    For each bar the volume-at-price histogram is built from the session open
+    up to *and including* that bar (no look-ahead bias).  The POC is the price
+    bin with the highest cumulative volume.
+
+    Parameters
+    ----------
+    df:
+        DataFrame with columns: ``high``, ``low``, ``close``, ``volume``, and
+        optionally ``datetime``.
+    n_bins:
+        Number of equally-spaced price bins spanning the session's high–low
+        range.  Default is 50.
+
+    Returns
+    -------
+    poc_price : pd.Series
+        POC price level for the current session as of each bar.
+    poc_proximity_pct : pd.Series
+        ``(close − POC) / POC × 100``.  Negative values indicate price is
+        below the POC; positive values indicate price is above the POC.
+    """
+    close = df["close"].astype(float)
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    vol = df["volume"].astype(float)
+    # Typical price is used to assign each bar to a price bin.
+    typical = (high + low + close) / 3.0
+
+    if "datetime" in df.columns:
+        dt = pd.to_datetime(df["datetime"])
+        date_key = dt.dt.date
+    else:
+        date_key = pd.Series(range(len(df)), index=df.index)
+
+    poc_price = pd.Series(np.nan, index=df.index)
+
+    for _, grp in df.groupby(date_key, sort=False):
+        idx = grp.index
+        grp_typical = typical.loc[idx].values
+        grp_high = high.loc[idx].values
+        grp_low = low.loc[idx].values
+        grp_vol = vol.loc[idx].values
+
+        session_high = grp_high.max()
+        session_low = grp_low.min()
+
+        if session_high == session_low:
+            # Degenerate session — all bars at same price level.
+            poc_price.loc[idx] = session_high
+            continue
+
+        bins = np.linspace(session_low, session_high, n_bins + 1)
+        bin_mids = (bins[:-1] + bins[1:]) / 2.0
+
+        cum_vol_by_bin = np.zeros(n_bins)
+        for i, bar_idx in enumerate(idx):
+            # Determine price bin for this bar's typical price.
+            bin_i = int(np.searchsorted(bins, grp_typical[i], side="right")) - 1
+            bin_i = min(max(bin_i, 0), n_bins - 1)
+            cum_vol_by_bin[bin_i] += grp_vol[i]
+            poc_price.loc[bar_idx] = bin_mids[int(np.argmax(cum_vol_by_bin))]
+
+    poc_proximity_pct = (close - poc_price) / poc_price.replace(0, np.nan) * 100.0
+    return poc_price, poc_proximity_pct
 
 
 # ---------------------------------------------------------------------------
@@ -657,3 +751,138 @@ def _add_candlestick_patterns(
     ).astype(int)
 
     return df
+
+
+# ---------------------------------------------------------------------------
+# Volume Profile visualization (optional — requires matplotlib)
+# ---------------------------------------------------------------------------
+
+def plot_volume_profile(
+    df: pd.DataFrame,
+    session_date: str | None = None,
+    n_bins: int = 50,
+    figsize: tuple[float, float] = (14, 6),
+) -> "matplotlib.figure.Figure":  # type: ignore[name-defined]
+    """Plot a session's price chart with the volume profile histogram.
+
+    Renders two panels side-by-side:
+    * **Left (wide)**: close-price line for the selected session with a
+      horizontal dashed line marking the POC.
+    * **Right (narrow)**: horizontal volume-at-price histogram (the profile).
+
+    Parameters
+    ----------
+    df:
+        OHLCV DataFrame, ideally after calling :func:`add_all_indicators` so
+        that ``poc_price`` is already present.  If ``poc_price`` is absent the
+        function computes it on-the-fly.
+    session_date:
+        Calendar date of the session to visualize, e.g. ``"2024-01-02"``.
+        When *None* the last available session in *df* is used.
+    n_bins:
+        Price bins to use when building the histogram.
+    figsize:
+        Matplotlib figure size ``(width, height)`` in inches.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        The figure object (caller may call ``fig.savefig(...)`` or
+        ``plt.show()``).
+
+    Raises
+    ------
+    ImportError
+        When ``matplotlib`` is not installed.
+    ValueError
+        When *session_date* is not found in *df*.
+    """
+    try:
+        import matplotlib.pyplot as plt
+        import matplotlib.gridspec as gridspec
+    except ImportError as exc:
+        raise ImportError(
+            "matplotlib is required for plot_volume_profile. "
+            "Install it with: pip install matplotlib"
+        ) from exc
+
+    # ------------------------------------------------------------------
+    # Isolate session
+    # ------------------------------------------------------------------
+    work = df.copy()
+    if "datetime" in work.columns:
+        work["_dt"] = pd.to_datetime(work["datetime"])
+    else:
+        work["_dt"] = pd.RangeIndex(len(work))
+    work["_date"] = work["_dt"].dt.date if hasattr(work["_dt"], "dt") else work["_dt"]
+
+    if session_date is None:
+        chosen_date = work["_date"].max()
+    else:
+        chosen_date = pd.Timestamp(session_date).date()
+
+    session = work[work["_date"] == chosen_date].copy()
+    if session.empty:
+        raise ValueError(f"No data found for session date {session_date!r}")
+
+    close = session["close"].astype(float)
+    high = session["high"].astype(float)
+    low = session["low"].astype(float)
+    vol = session["volume"].astype(float)
+    typical = (high + low + close) / 3.0
+
+    # ------------------------------------------------------------------
+    # Build the full-session volume profile (end-of-session histogram)
+    # ------------------------------------------------------------------
+    s_high = high.max()
+    s_low = low.min()
+
+    if s_high == s_low:
+        bin_edges = np.array([s_low - 0.5, s_high + 0.5])
+        bin_mids = np.array([(s_low + s_high) / 2.0])
+        vol_by_bin = np.array([vol.sum()])
+    else:
+        bin_edges = np.linspace(s_low, s_high, n_bins + 1)
+        bin_mids = (bin_edges[:-1] + bin_edges[1:]) / 2.0
+        vol_by_bin = np.zeros(n_bins)
+        for tp_val, v_val in zip(typical.values, vol.values):
+            bi = int(np.searchsorted(bin_edges, tp_val, side="right")) - 1
+            bi = min(max(bi, 0), n_bins - 1)
+            vol_by_bin[bi] += v_val
+
+    poc_bin = int(np.argmax(vol_by_bin))
+    poc_px = bin_mids[poc_bin]
+
+    # If the DataFrame already carries poc_price use the last bar's value
+    # (same result, just avoids re-computation noise from binning).
+    if "poc_price" in session.columns:
+        poc_px = float(session["poc_price"].iloc[-1])
+
+    # ------------------------------------------------------------------
+    # Build figure
+    # ------------------------------------------------------------------
+    fig = plt.figure(figsize=figsize, layout="constrained")
+    gs = gridspec.GridSpec(1, 2, width_ratios=[3, 1], figure=fig)
+    ax_price = fig.add_subplot(gs[0])
+    ax_prof = fig.add_subplot(gs[1], sharey=ax_price)
+
+    # Price panel
+    x_vals = np.arange(len(session))
+    ax_price.plot(x_vals, close.values, color="steelblue", linewidth=1.2, label="Close")
+    ax_price.axhline(poc_px, color="crimson", linestyle="--", linewidth=1.2,
+                     label=f"POC {poc_px:.2f}")
+    ax_price.set_title(f"Volume Profile — {chosen_date}", fontsize=12)
+    ax_price.set_xlabel("Bar index")
+    ax_price.set_ylabel("Price")
+    ax_price.legend(fontsize=9)
+    ax_price.grid(True, alpha=0.3)
+
+    # Profile panel (horizontal histogram)
+    ax_prof.barh(bin_mids, vol_by_bin, height=(bin_edges[1] - bin_edges[0]) * 0.9,
+                 color="steelblue", alpha=0.6)
+    ax_prof.axhline(poc_px, color="crimson", linestyle="--", linewidth=1.2)
+    ax_prof.set_xlabel("Volume")
+    ax_prof.tick_params(labelleft=False)
+    ax_prof.grid(True, axis="x", alpha=0.3)
+
+    return fig
