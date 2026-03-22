@@ -360,7 +360,18 @@ class HybridStrategy(BaseStrategy):
 
         for cat in self.catalyst_dates:
             cat_ts = pd.Timestamp(cat)
-            if cat_ts.hour == 0 and cat_ts.minute == 0 and cat_ts.second == 0:
+            # Treat as a date-only catalyst if the entire time component is midnight
+            # (i.e. the user passed a date string like "2024-01-25" or a date-only
+            # pd.Timestamp).  For an explicit intraday time, pass a Timestamp with a
+            # non-zero hour/minute/second to get the ±N-bars window instead.
+            is_date_only = (
+                cat_ts.hour == 0
+                and cat_ts.minute == 0
+                and cat_ts.second == 0
+                and cat_ts.microsecond == 0
+                and cat_ts.nanosecond == 0
+            )
+            if is_date_only:
                 # Date-only catalyst — suppress entire trading day.
                 mask = dt.dt.date == cat_ts.date()
                 signal[mask] = 0
