@@ -10,6 +10,11 @@ signal layers into a single entry signal:
 * ML score filter (RF + LSTM combined probability)
 * Market regime filter (SPY 5-bar rolling VWAP trend gate)
 
+:class:`VWAPMeanReversionStrategy` is a dedicated intraday mean-reversion
+strategy that enters long when price is at/near the session VWAP with
+optional RSI, volume, and candlestick confirmation filters and ATR-based
+take-profit / stop-loss exits.
+
 New strategies can be added by subclassing :class:`BaseStrategy` or by
 passing custom ``rule_fn`` callables to :class:`HybridStrategy`.
 """
@@ -100,6 +105,155 @@ class TAStrategy(BaseStrategy):
             & (c > bb_lower)
         ).astype(int)
         return signal
+
+
+# ---------------------------------------------------------------------------
+# VWAP-anchored mean reversion strategy
+# ---------------------------------------------------------------------------
+
+class VWAPMeanReversionStrategy(BaseStrategy):
+    """VWAP-anchored mean reversion strategy for intraday scalping.
+
+    Entry logic (all conditions must be True):
+
+    1. **VWAP proximity** — ``|price_vs_vwap| <= vwap_proximity_pct`` — price
+       is within *vwap_proximity_pct* % of the intraday session VWAP.
+    2. **RSI filter** — RSI_14 is between *rsi_min* and *rsi_max*, avoiding
+       deeply oversold traps and overbought extensions.
+    3. **Volume confirmation** — current bar volume is at least
+       *volume_factor* × the rolling *volume_ma_bars*-bar average volume.
+    4. **Candlestick confirmation** (optional) — ``pat_bull_signal == 1`` must
+       be present at the entry bar (disable with ``require_bull_candle=False``).
+
+    ATR-based stop-loss and take-profit exits are applied automatically by
+    :meth:`backtest` using *atr_sl_mult* × ATR_14 and *atr_tp_mult* × ATR_14
+    relative to the entry price.
+
+    Works best on liquid index ETFs (SPY, QQQ, IVV) at the 5-minute bar level.
+    Requires ``add_all_indicators()`` to have been called on the input DataFrame
+    so that ``vwap``, ``price_vs_vwap``, ``rsi_14``, ``atr_14``, and
+    ``pat_bull_signal`` columns are present.
+
+    Parameters
+    ----------
+    vwap_proximity_pct:
+        Maximum absolute percentage deviation from VWAP to allow entry
+        (default 0.1, i.e. ±0.1 %).
+    rsi_min:
+        Minimum RSI_14 value at entry (default 30).
+    rsi_max:
+        Maximum RSI_14 value at entry (default 60, avoids overbought entries).
+    volume_ma_bars:
+        Rolling window (in bars) for computing the volume baseline (default 20).
+    volume_factor:
+        Minimum ratio of current bar volume to the rolling average required for
+        entry (default 1.0 — at-or-above-average volume).
+    require_bull_candle:
+        When ``True`` (default), a bullish candlestick pattern
+        (``pat_bull_signal == 1``) must also be present at the entry bar.
+    atr_sl_mult:
+        ATR multiplier for the stop-loss distance below entry (default 1.0).
+    atr_tp_mult:
+        ATR multiplier for the take-profit distance above entry (default 1.5).
+    hold_bars:
+        Maximum holding period in bars before a time-based exit fires
+        (default 6, i.e. 30 minutes at 5-minute bars).
+    """
+
+    name = "vwap_mean_reversion"
+
+    def __init__(
+        self,
+        vwap_proximity_pct: float = 0.1,
+        rsi_min: float = 30.0,
+        rsi_max: float = 60.0,
+        volume_ma_bars: int = 20,
+        volume_factor: float = 1.0,
+        require_bull_candle: bool = True,
+        atr_sl_mult: float = 1.0,
+        atr_tp_mult: float = 1.5,
+        hold_bars: int = 6,
+    ) -> None:
+        self.vwap_proximity_pct = vwap_proximity_pct
+        self.rsi_min = rsi_min
+        self.rsi_max = rsi_max
+        self.volume_ma_bars = volume_ma_bars
+        self.volume_factor = volume_factor
+        self.require_bull_candle = require_bull_candle
+        self.atr_sl_mult = atr_sl_mult
+        self.atr_tp_mult = atr_tp_mult
+        self.hold_bars = hold_bars
+
+    def generate_signals(self, df: pd.DataFrame) -> pd.Series:
+        """Return a 0/1 entry signal Series aligned with *df*.
+
+        Each ``1`` marks a bar where all entry conditions are satisfied.
+        """
+        c = df["close"].astype(float)
+        v = df["volume"].astype(float)
+
+        # ----------------------------------------------------------------
+        # Condition 1 — VWAP proximity
+        # ----------------------------------------------------------------
+        if "price_vs_vwap" in df.columns:
+            price_vs_vwap = df["price_vs_vwap"].astype(float)
+        elif "vwap" in df.columns:
+            vwap = df["vwap"].astype(float)
+            price_vs_vwap = (c - vwap) / vwap.replace(0, np.nan) * 100
+        else:
+            # No VWAP available — treat all bars as at-VWAP so the strategy
+            # degrades gracefully to its remaining filters.
+            logger.warning(
+                "VWAPMeanReversionStrategy: 'vwap' column not found; "
+                "VWAP proximity filter is inactive."
+            )
+            price_vs_vwap = pd.Series(0.0, index=df.index)
+
+        at_vwap = price_vs_vwap.abs() <= self.vwap_proximity_pct
+
+        # ----------------------------------------------------------------
+        # Condition 2 — RSI filter
+        # ----------------------------------------------------------------
+        rsi = df.get("rsi_14", pd.Series(50.0, index=df.index)).astype(float)
+        rsi_ok = (rsi >= self.rsi_min) & (rsi <= self.rsi_max)
+
+        # ----------------------------------------------------------------
+        # Condition 3 — Volume confirmation
+        # ----------------------------------------------------------------
+        vol_ma = v.rolling(self.volume_ma_bars, min_periods=1).mean()
+        vol_ok = v >= self.volume_factor * vol_ma
+
+        # ----------------------------------------------------------------
+        # Combine core conditions
+        # ----------------------------------------------------------------
+        signal = at_vwap & rsi_ok & vol_ok
+
+        # ----------------------------------------------------------------
+        # Condition 4 — Optional candlestick confirmation
+        # ----------------------------------------------------------------
+        if self.require_bull_candle:
+            pat_bull = df.get("pat_bull_signal", pd.Series(0, index=df.index))
+            signal = signal & (pat_bull == 1)
+
+        return signal.astype(int)
+
+    def backtest(
+        self,
+        df: pd.DataFrame,
+        ticker: str = "UNKNOWN",
+        **bt_kwargs,
+    ) -> BacktestResult:
+        """Generate signals and run the backtester with ATR exits.
+
+        The strategy's *hold_bars*, *atr_sl_mult*, and *atr_tp_mult* are used
+        as defaults.  They can be overridden via *bt_kwargs*.  The ``atr_14``
+        column from *df* is automatically used as the ATR series unless an
+        explicit ``atr`` kwarg is provided.
+        """
+        bt_kwargs.setdefault("hold_bars", self.hold_bars)
+        bt_kwargs.setdefault("atr_sl_mult", self.atr_sl_mult)
+        bt_kwargs.setdefault("atr_tp_mult", self.atr_tp_mult)
+        return super().backtest(df, ticker=ticker, **bt_kwargs)
 
 
 # ---------------------------------------------------------------------------
