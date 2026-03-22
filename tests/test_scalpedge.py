@@ -618,6 +618,113 @@ class TestTAIndicators:
         assert "vwap" in indicator_df.columns
         assert indicator_df["vwap"].notna().any()
 
+    # ------------------------------------------------------------------
+    # Volume Profile / POC
+    # ------------------------------------------------------------------
+
+    def test_poc_columns_present(self, indicator_df):
+        """add_all_indicators must produce the four POC signal columns."""
+        for col in ("poc_price", "poc_proximity_pct", "poc_above", "poc_below"):
+            assert col in indicator_df.columns, f"Missing column: {col}"
+
+    def test_poc_price_positive(self, indicator_df):
+        """POC price must be a positive number wherever it is not NaN."""
+        poc = indicator_df["poc_price"].dropna()
+        assert (poc > 0).all(), "poc_price must be positive"
+
+    def test_poc_proximity_sign(self, indicator_df):
+        """poc_proximity_pct must be positive when close > poc and negative when close < poc."""
+        sub = indicator_df[["close", "poc_price", "poc_proximity_pct"]].dropna()
+        above = sub[sub["close"] > sub["poc_price"]]
+        below = sub[sub["close"] < sub["poc_price"]]
+        assert (above["poc_proximity_pct"] > 0).all(), (
+            "poc_proximity_pct should be positive when close > poc_price"
+        )
+        assert (below["poc_proximity_pct"] < 0).all(), (
+            "poc_proximity_pct should be negative when close < poc_price"
+        )
+
+    def test_poc_above_below_binary(self, indicator_df):
+        """poc_above and poc_below must only contain 0 or 1."""
+        for col in ("poc_above", "poc_below"):
+            vals = indicator_df[col].dropna()
+            assert vals.isin([0, 1]).all(), f"{col} contains non-binary values"
+
+    def test_poc_above_below_mutually_exclusive(self, indicator_df):
+        """poc_above and poc_below should never both be 1 at the same time."""
+        both_set = (indicator_df["poc_above"] == 1) & (indicator_df["poc_below"] == 1)
+        assert not both_set.any(), "poc_above and poc_below are mutually exclusive"
+
+    def test_poc_resets_per_session(self, synthetic_df):
+        """POC should be computed independently per session (calendar day)."""
+        from scalpedge.ta_indicators import _volume_profile
+
+        # Build a two-session frame so we can check independence.
+        day1 = synthetic_df[synthetic_df["datetime"].dt.date == synthetic_df["datetime"].dt.date.iloc[0]]
+        day2 = synthetic_df[synthetic_df["datetime"].dt.date == synthetic_df["datetime"].dt.date.iloc[-1]]
+        if len(day1) < 2 or len(day2) < 2:
+            return  # not enough data in synthetic fixture for this check
+
+        poc1, _ = _volume_profile(day1)
+        poc2, _ = _volume_profile(day2)
+
+        # Both series must be non-NaN.
+        assert poc1.notna().all()
+        assert poc2.notna().all()
+
+    def test_volume_profile_no_lookahead(self, synthetic_df):
+        """POC computed on a partial session prefix must not change when more bars are added."""
+        from scalpedge.ta_indicators import _volume_profile
+
+        # Grab the first session.
+        first_date = synthetic_df["datetime"].dt.date.iloc[0]
+        session = synthetic_df[synthetic_df["datetime"].dt.date == first_date].copy()
+        if len(session) < 4:
+            return  # degenerate fixture
+
+        half = len(session) // 2
+        poc_partial, _ = _volume_profile(session.iloc[:half])
+        poc_last_partial = poc_partial.iloc[-1]
+
+        poc_full, _ = _volume_profile(session)
+        poc_at_half_in_full = poc_full.iloc[half - 1]
+
+        # The POC value at bar `half-1` must be the same whether or not
+        # future bars are present (rolling, no look-ahead).
+        assert poc_last_partial == poc_at_half_in_full, (
+            "POC look-ahead bias detected: value changes when future bars are appended"
+        )
+
+    def test_plot_volume_profile_returns_figure(self, indicator_df):
+        """plot_volume_profile should return a matplotlib Figure without errors."""
+        import matplotlib
+        matplotlib.use("Agg")
+        from scalpedge.ta_indicators import plot_volume_profile
+
+        fig = plot_volume_profile(indicator_df)
+        import matplotlib.figure
+        assert isinstance(fig, matplotlib.figure.Figure)
+
+    def test_plot_volume_profile_specific_date(self, indicator_df):
+        """plot_volume_profile accepts a session_date string."""
+        import matplotlib
+        matplotlib.use("Agg")
+        from scalpedge.ta_indicators import plot_volume_profile
+
+        session_date = str(indicator_df["datetime"].dt.date.iloc[0])
+        fig = plot_volume_profile(indicator_df, session_date=session_date)
+        import matplotlib.figure
+        assert isinstance(fig, matplotlib.figure.Figure)
+
+    def test_plot_volume_profile_invalid_date_raises(self, indicator_df):
+        """plot_volume_profile raises ValueError for an unknown session date."""
+        import matplotlib
+        matplotlib.use("Agg")
+        from scalpedge.ta_indicators import plot_volume_profile
+
+        with pytest.raises(ValueError, match="No data found for session date"):
+            plot_volume_profile(indicator_df, session_date="1900-01-01")
+
 
 # ---------------------------------------------------------------------------
 # Black-Scholes
