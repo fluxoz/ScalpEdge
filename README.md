@@ -263,12 +263,52 @@ Catalyst dates can also be fetched automatically via `PolygonClient.fetch_events
 | Layer | Module | What it does |
 |---|---|---|
 | Data | `data.py` | Fetches 5m OHLCV from Polygon.io Stocks Advanced (or yfinance fallback), stores in Parquet, auto-appends new bars; also exposes tick trades, NBBO quotes, snapshots, news, events, and WebSocket streaming |
-| TA | `ta_indicators.py` | EMA/SMA/RSI/MACD/BB/ATR/OBV/VWAP/Stoch/ADX + 60+ candle patterns; also computes bid-ask microstructure features (spread, imbalance) when quote data is available |
+| TA | `ta_indicators.py` | EMA/SMA/RSI/MACD/BB/ATR/OBV/VWAP/Stoch/ADX + Volume Profile/POC + 60+ candle patterns; also computes bid-ask microstructure features (spread, imbalance) when quote data is available |
 | Probabilities | `probabilities.py` | Monte Carlo random walk + Markov chain order-2 transition probs |
 | Options | `options.py` | Black-Scholes call/put, delta, gamma, vega, theta, rho, implied vol |
 | ML | `ml.py` | RandomForest + PyTorch LSTM → combined P(up) score; microstructure features (`spread_pct`, `bid_ask_imbalance`, `imbalance_ma_10`) included when available |
 | Backtester | `backtester.py` | Vectorized simulation, fee+slippage, equity curve, full metrics |
 | Strategies | `strategies.py` | TAStrategy (baseline) + HybridStrategy (all layers + optional catalyst suppression filter) |
+
+---
+
+## Volume Profile & Point of Control (POC)
+
+`add_all_indicators()` now computes a **rolling intraday volume profile** for
+each calendar session and exposes four signal columns:
+
+| Column | Description |
+|---|---|
+| `poc_price` | Price level with the most cumulative volume traded in the session so far (no look-ahead) |
+| `poc_proximity_pct` | `(close − POC) / POC × 100` — negative = below POC, positive = above POC |
+| `poc_above` | `1` when `close > poc_price`, else `0` |
+| `poc_below` | `1` when `close < poc_price`, else `0` |
+
+These features are appended alongside all other indicators and are immediately
+usable as signal inputs in your custom strategy.
+
+### Visualization
+
+```python
+import matplotlib.pyplot as plt
+import pandas as pd
+from scalpedge.ta_indicators import add_all_indicators, plot_volume_profile
+
+df = pd.read_parquet("data/SPY_5m.parquet")
+df = add_all_indicators(df)
+
+fig = plot_volume_profile(df, session_date="2024-01-02")
+plt.show()
+# or: fig.savefig("volume_profile_2024-01-02.png", dpi=150)
+```
+
+`plot_volume_profile` renders two side-by-side panels:
+* **Left** — close-price line with a dashed line marking the session POC.
+* **Right** — horizontal volume-at-price histogram (the profile itself).
+
+The function can be called for any session date present in the DataFrame and
+returns a `matplotlib.figure.Figure` so you can embed it in notebooks or save
+to disk.
 
 ---
 
