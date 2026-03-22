@@ -156,6 +156,46 @@ def add_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # -----------------------------------------------------------------------
     df = _add_candlestick_patterns(df, o, h, l, c)
 
+    # -----------------------------------------------------------------------
+    # Bid-ask microstructure features (only if quote columns are present)
+    # -----------------------------------------------------------------------
+    df = add_quote_features(df)
+
+    return df
+
+
+def add_quote_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add bid-ask microstructure features if quote columns are present.
+
+    Expected input columns (optional — function is a no-op if absent):
+        bid_price, ask_price, bid_size, ask_size
+
+    Added columns:
+        spread              — ask_price - bid_price
+        mid_price           — (bid_price + ask_price) / 2
+        bid_ask_imbalance   — (bid_size - ask_size) / (bid_size + ask_size + 1e-9)
+        spread_pct          — spread / mid_price * 100 (spread as % of mid)
+        imbalance_ma_10     — 10-bar rolling mean of bid_ask_imbalance
+
+    Returns the DataFrame (copy) with new columns appended; unchanged if
+    the required input columns are absent.
+    """
+    required = {"bid_price", "ask_price", "bid_size", "ask_size"}
+    if not required.issubset(df.columns):
+        return df
+
+    df = df.copy()
+    bid = df["bid_price"].astype(float)
+    ask = df["ask_price"].astype(float)
+    bid_sz = df["bid_size"].astype(float)
+    ask_sz = df["ask_size"].astype(float)
+
+    df["spread"] = ask - bid
+    df["mid_price"] = (bid + ask) / 2
+    df["bid_ask_imbalance"] = (bid_sz - ask_sz) / (bid_sz + ask_sz + 1e-9)
+    df["spread_pct"] = df["spread"] / df["mid_price"].replace(0, np.nan) * 100
+    df["imbalance_ma_10"] = df["bid_ask_imbalance"].rolling(10).mean()
+
     return df
 
 
