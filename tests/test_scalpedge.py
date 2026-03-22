@@ -791,6 +791,130 @@ class TestMLModels:
         assert len(score) == len(clean_df)
         assert np.all((score >= 0) & (score <= 1))
 
+    # ------------------------------------------------------------------
+    # Rolling / online retraining
+    # ------------------------------------------------------------------
+
+    @_skip_no_sklearn
+    def test_rf_partial_fit_grows_trees(self, clean_df):
+        from scalpedge.ml import RandomForestModel
+
+        rf = RandomForestModel(n_estimators=20)
+        rf.fit(clean_df)
+        initial_trees = rf._model.n_estimators
+        rf.partial_fit(clean_df, n_new_trees=10)
+        assert rf._model.n_estimators == initial_trees + 10
+        proba = rf.predict_proba(clean_df)
+        assert proba.shape == (len(clean_df),)
+        assert np.all((proba >= 0) & (proba <= 1))
+
+    @_skip_no_sklearn
+    def test_rf_partial_fit_without_prior_fit(self, clean_df):
+        from scalpedge.ml import RandomForestModel
+
+        rf = RandomForestModel(n_estimators=20)
+        rf.partial_fit(clean_df)
+        assert rf._fitted
+        assert rf._last_fit_dt is not None
+
+    @_skip_no_sklearn
+    def test_rf_staleness(self):
+        from datetime import datetime, timedelta, timezone
+
+        from scalpedge.ml import RandomForestModel
+
+        rf = RandomForestModel(max_staleness=timedelta(hours=1))
+        assert rf.is_stale()  # Never fitted
+
+        rf._last_fit_dt = datetime.now(timezone.utc)
+        assert not rf.is_stale()
+
+        stale_time = datetime.now(timezone.utc) + timedelta(hours=2)
+        assert rf.is_stale(now=stale_time)
+
+    @_skip_no_sklearn
+    def test_rf_last_fit_dt_set(self, clean_df):
+        from scalpedge.ml import RandomForestModel
+
+        rf = RandomForestModel(n_estimators=20)
+        assert rf.last_fit_dt is None
+        rf.fit(clean_df)
+        assert rf.last_fit_dt is not None
+
+    @_skip_no_ml
+    def test_lstm_partial_fit(self, clean_df):
+        from scalpedge.ml import LSTMModel
+
+        lstm = LSTMModel(seq_len=10, epochs=2, hidden_size=16)
+        lstm.fit(clean_df)
+        first_fit_dt = lstm.last_fit_dt
+        lstm.partial_fit(clean_df, epochs=1)
+        assert lstm.last_fit_dt >= first_fit_dt
+        proba = lstm.predict_proba(clean_df)
+        assert proba.shape == (len(clean_df),)
+        assert np.all((proba >= 0) & (proba <= 1))
+
+    @_skip_no_ml
+    def test_lstm_partial_fit_without_prior_fit(self, clean_df):
+        from scalpedge.ml import LSTMModel
+
+        lstm = LSTMModel(seq_len=10, epochs=2, hidden_size=16)
+        lstm.partial_fit(clean_df)
+        assert lstm._fitted
+        assert lstm.last_fit_dt is not None
+
+    @_skip_no_ml
+    def test_lstm_staleness(self):
+        from datetime import datetime, timedelta, timezone
+
+        from scalpedge.ml import LSTMModel
+
+        lstm = LSTMModel(max_staleness=timedelta(hours=1))
+        assert lstm.is_stale()
+
+        lstm._last_fit_dt = datetime.now(timezone.utc)
+        assert not lstm.is_stale()
+
+        stale_time = datetime.now(timezone.utc) + timedelta(hours=2)
+        assert lstm.is_stale(now=stale_time)
+
+    @_skip_no_ml
+    def test_engine_partial_fit(self, clean_df):
+        from scalpedge.ml import MLEngine
+
+        engine = MLEngine(
+            rf_kwargs={"n_estimators": 20},
+            lstm_kwargs={"seq_len": 10, "epochs": 2, "hidden_size": 16},
+        )
+        engine.fit(clean_df)
+        assert not engine.is_stale()
+
+        engine.partial_fit(clean_df, rf_n_new_trees=5, lstm_epochs=1)
+        score = engine.score(clean_df)
+        assert len(score) == len(clean_df)
+        assert np.all((score >= 0) & (score <= 1))
+
+    @_skip_no_ml
+    def test_engine_staleness_warning(self, clean_df, caplog):
+        import logging
+        from datetime import timedelta
+
+        from scalpedge.ml import MLEngine
+
+        engine = MLEngine(
+            rf_kwargs={"n_estimators": 20, "max_staleness": timedelta(seconds=0)},
+            lstm_kwargs={
+                "seq_len": 10,
+                "epochs": 2,
+                "hidden_size": 16,
+                "max_staleness": timedelta(seconds=0),
+            },
+        )
+        engine.fit(clean_df)
+        with caplog.at_level(logging.WARNING, logger="scalpedge.ml"):
+            engine.score(clean_df)
+        assert "stale" in caplog.text.lower()
+
 
 # ---------------------------------------------------------------------------
 # Backtester
