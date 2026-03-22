@@ -396,13 +396,13 @@ def cmd_live(args: argparse.Namespace) -> None:
     # 2. Fit HybridStrategy on 80% of historical data
     # ------------------------------------------------------------------
     use_regime = spy_df is not None and any(t != "SPY" for t in tickers)
-    hybrid_cfg = dict(
+    hybrid_cfg = {
         **HYBRID_CONFIG,
-        use_ml=use_ml_live,
-        use_regime_filter=use_regime,
-        spy_df=spy_df if use_regime else None,
-        regime_lookback=5,
-    )
+        "use_ml": use_ml_live,
+        "use_regime_filter": use_regime,
+        "spy_df": spy_df if use_regime else None,
+        "regime_lookback": 5,
+    }
     strategy = HybridStrategy(**hybrid_cfg)
 
     split    = int(len(primary_df) * 0.80)
