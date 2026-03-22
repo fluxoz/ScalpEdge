@@ -2406,3 +2406,65 @@ class TestLiveEngine:
         assert _safe_float(1.5) == 1.5
         assert _safe_float("2.0") == 2.0
         assert _safe_float("bad") is None
+
+    def test_on_bar_update_callback_fires_every_bar(self, _strategy, clean_df):
+        """on_bar_update must be called on every processed bar, not just signal bars."""
+        from scalpedge.live_engine import LiveSignalEngine
+        import unittest.mock as mock
+        import asyncio
+
+        updates: list[tuple[str, dict, int]] = []
+
+        def capture_update(ticker: str, bar: dict, last_signal: int) -> None:
+            updates.append((ticker, bar, last_signal))
+
+        engine = LiveSignalEngine(
+            ["TEST"], _strategy, on_bar_update=capture_update, buffer_size=500
+        )
+        engine.seed("TEST", clean_df.iloc[:400])
+
+        with mock.patch.object(_strategy, "generate_signals") as mock_gen:
+            # First bar: no signal (0)
+            def no_signal(df):
+                return pd.Series(0, index=df.index)
+
+            mock_gen.side_effect = no_signal
+            row = clean_df.iloc[400].to_dict()
+            row["ticker"] = "TEST"
+            asyncio.run(engine._on_bar(row))
+
+        assert len(updates) == 1
+        ticker, bar_dict, sig = updates[0]
+        assert ticker == "TEST"
+        assert sig == 0
+        assert "close" in bar_dict
+
+    def test_on_bar_update_callback_reports_signal_value(self, _strategy, clean_df):
+        """on_bar_update must pass last_signal=1 when a signal fires."""
+        from scalpedge.live_engine import LiveSignalEngine
+        import unittest.mock as mock
+        import asyncio
+
+        updates: list[tuple[str, dict, int]] = []
+
+        def capture_update(ticker: str, bar: dict, last_signal: int) -> None:
+            updates.append((ticker, bar, last_signal))
+
+        engine = LiveSignalEngine(
+            ["TEST"], _strategy, on_bar_update=capture_update, buffer_size=500
+        )
+        engine.seed("TEST", clean_df.iloc[:400])
+
+        with mock.patch.object(_strategy, "generate_signals") as mock_gen:
+            def signal_on_last(df):
+                s = pd.Series(0, index=df.index)
+                s.iloc[-1] = 1
+                return s
+
+            mock_gen.side_effect = signal_on_last
+            row = clean_df.iloc[400].to_dict()
+            row["ticker"] = "TEST"
+            asyncio.run(engine._on_bar(row))
+
+        assert len(updates) == 1
+        assert updates[0][2] == 1  # last_signal should be 1
