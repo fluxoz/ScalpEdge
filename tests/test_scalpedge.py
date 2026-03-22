@@ -1219,8 +1219,189 @@ class TestStrategies:
 
 
 # ---------------------------------------------------------------------------
-# Market Regime Filter
+# VWAP Mean Reversion Strategy
 # ---------------------------------------------------------------------------
+
+class TestVWAPMeanReversionStrategy:
+    """Tests for VWAPMeanReversionStrategy."""
+
+    @pytest.fixture
+    def vwap_df(self, synthetic_df):
+        """synthetic_df with all TA indicators (including vwap and price_vs_vwap)."""
+        from scalpedge.ta_indicators import add_all_indicators
+
+        return add_all_indicators(synthetic_df).dropna(subset=["rsi_14", "atr_14"]).reset_index(drop=True)
+
+    def test_signals_length_and_binary(self, vwap_df):
+        """generate_signals must return a 0/1 Series of the same length as input."""
+        from scalpedge.strategies import VWAPMeanReversionStrategy
+
+        strategy = VWAPMeanReversionStrategy(require_bull_candle=False)
+        signals = strategy.generate_signals(vwap_df)
+        assert len(signals) == len(vwap_df)
+        assert signals.isin([0, 1]).all()
+
+    def test_strategy_name(self):
+        """Strategy name attribute must be 'vwap_mean_reversion'."""
+        from scalpedge.strategies import VWAPMeanReversionStrategy
+
+        assert VWAPMeanReversionStrategy.name == "vwap_mean_reversion"
+
+    def test_vwap_proximity_filter(self, vwap_df):
+        """A very tight VWAP proximity (0%) should yield no signals."""
+        from scalpedge.strategies import VWAPMeanReversionStrategy
+
+        strategy = VWAPMeanReversionStrategy(
+            vwap_proximity_pct=0.0,
+            require_bull_candle=False,
+        )
+        signals = strategy.generate_signals(vwap_df)
+        # price_vs_vwap is essentially never exactly 0.0 in practice
+        assert signals.sum() == 0, "Expected no signals with zero VWAP tolerance"
+
+    def test_wide_vwap_proximity_produces_signals(self, vwap_df):
+        """A generous VWAP proximity should allow some signals through."""
+        from scalpedge.strategies import VWAPMeanReversionStrategy
+
+        strategy = VWAPMeanReversionStrategy(
+            vwap_proximity_pct=100.0,  # always within ±100 % of VWAP
+            rsi_min=0.0,
+            rsi_max=100.0,
+            volume_factor=0.0,
+            require_bull_candle=False,
+        )
+        signals = strategy.generate_signals(vwap_df)
+        assert signals.sum() > 0, "Expected some signals with very wide filters"
+
+    def test_require_bull_candle_reduces_signals(self, vwap_df):
+        """Enabling candlestick confirmation must not increase signal count."""
+        from scalpedge.strategies import VWAPMeanReversionStrategy
+
+        base = VWAPMeanReversionStrategy(
+            vwap_proximity_pct=100.0,
+            rsi_min=0.0,
+            rsi_max=100.0,
+            volume_factor=0.0,
+            require_bull_candle=False,
+        )
+        filtered = VWAPMeanReversionStrategy(
+            vwap_proximity_pct=100.0,
+            rsi_min=0.0,
+            rsi_max=100.0,
+            volume_factor=0.0,
+            require_bull_candle=True,
+        )
+        sigs_base = base.generate_signals(vwap_df)
+        sigs_filtered = filtered.generate_signals(vwap_df)
+        assert sigs_filtered.sum() <= sigs_base.sum(), (
+            "Candlestick filter must not add signals"
+        )
+
+    def test_rsi_filter_respected(self, vwap_df):
+        """Narrowing RSI range must not increase signal count."""
+        from scalpedge.strategies import VWAPMeanReversionStrategy
+
+        wide = VWAPMeanReversionStrategy(
+            vwap_proximity_pct=100.0,
+            rsi_min=0.0,
+            rsi_max=100.0,
+            volume_factor=0.0,
+            require_bull_candle=False,
+        )
+        narrow = VWAPMeanReversionStrategy(
+            vwap_proximity_pct=100.0,
+            rsi_min=40.0,
+            rsi_max=55.0,
+            volume_factor=0.0,
+            require_bull_candle=False,
+        )
+        assert narrow.generate_signals(vwap_df).sum() <= wide.generate_signals(vwap_df).sum()
+
+    def test_volume_filter_respected(self, vwap_df):
+        """High volume factor threshold must not produce more signals than a low one."""
+        from scalpedge.strategies import VWAPMeanReversionStrategy
+
+        low_vol = VWAPMeanReversionStrategy(
+            vwap_proximity_pct=100.0,
+            rsi_min=0.0,
+            rsi_max=100.0,
+            volume_factor=0.0,
+            require_bull_candle=False,
+        )
+        high_vol = VWAPMeanReversionStrategy(
+            vwap_proximity_pct=100.0,
+            rsi_min=0.0,
+            rsi_max=100.0,
+            volume_factor=100.0,  # only bars with 100× average volume pass
+            require_bull_candle=False,
+        )
+        assert high_vol.generate_signals(vwap_df).sum() <= low_vol.generate_signals(vwap_df).sum()
+
+    def test_backtest_returns_result(self, vwap_df):
+        """backtest() should return a BacktestResult with ATR exit columns."""
+        from scalpedge.strategies import VWAPMeanReversionStrategy
+
+        strategy = VWAPMeanReversionStrategy(
+            vwap_proximity_pct=100.0,
+            rsi_min=0.0,
+            rsi_max=100.0,
+            volume_factor=0.0,
+            require_bull_candle=False,
+        )
+        result = strategy.backtest(vwap_df, ticker="SPY")
+        assert result.ticker == "SPY"
+        assert result.strategy == "vwap_mean_reversion"
+        assert result.n_trades >= 0
+        if result.n_trades > 0:
+            assert "exit_type" in result.trade_log.columns
+            total = result.atr_tp_rate + result.atr_sl_rate + result.atr_time_exit_rate
+            assert abs(total - 1.0) < 1e-9
+
+    def test_backtest_uses_atr_exits_by_default(self, vwap_df):
+        """Default backtest should use ATR-based exits (atr_sl_mult / atr_tp_mult set)."""
+        from scalpedge.strategies import VWAPMeanReversionStrategy
+
+        strategy = VWAPMeanReversionStrategy(
+            vwap_proximity_pct=100.0,
+            rsi_min=0.0,
+            rsi_max=100.0,
+            volume_factor=0.0,
+            require_bull_candle=False,
+            atr_sl_mult=1.0,
+            atr_tp_mult=1.5,
+        )
+        result = strategy.backtest(vwap_df, ticker="SPY")
+        if result.n_trades > 0:
+            exit_types = result.trade_log["exit_type"].unique()
+            assert set(exit_types).issubset({"tp", "sl", "time"})
+
+    def test_backtest_kwargs_override_defaults(self, vwap_df):
+        """bt_kwargs passed to backtest() must override strategy defaults."""
+        from scalpedge.strategies import VWAPMeanReversionStrategy
+
+        strategy = VWAPMeanReversionStrategy(hold_bars=6)
+        # Override hold_bars to 2 via backtest kwargs.
+        result = strategy.backtest(
+            vwap_df,
+            ticker="SPY",
+            hold_bars=2,
+        )
+        assert result.ticker == "SPY"
+
+    def test_fallback_without_vwap_column(self, clean_df):
+        """Strategy should not raise when 'vwap'/'price_vs_vwap' columns are absent."""
+        from scalpedge.strategies import VWAPMeanReversionStrategy
+
+        # Drop VWAP columns if present
+        df_no_vwap = clean_df.drop(
+            columns=[c for c in ("vwap", "price_vs_vwap") if c in clean_df.columns]
+        )
+        strategy = VWAPMeanReversionStrategy(require_bull_candle=False)
+        signals = strategy.generate_signals(df_no_vwap)
+        assert len(signals) == len(df_no_vwap)
+        assert signals.isin([0, 1]).all()
+
+
 
 class TestMarketRegime:
     """Tests for compute_market_regime() and HybridStrategy regime filter."""

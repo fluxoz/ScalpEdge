@@ -305,6 +305,74 @@ uv run python main.py backtest TSLA AAPL NVDA
 
 ---
 
+## VWAP-Anchored Mean Reversion Strategy
+
+`VWAPMeanReversionStrategy` is a dedicated intraday mean-reversion approach
+that enters long when price is near the session VWAP with optional RSI,
+volume, and candlestick confirmation.  ATR-based stop-loss and take-profit
+exits fire automatically.
+
+Works especially well for **liquid index ETFs** (SPY, QQQ, IVV) at the
+5-minute bar level.
+
+### Entry conditions
+
+All of the following must be satisfied at the entry bar:
+
+| # | Condition | Default |
+|---|---|---|
+| 1 | `\|price_vs_vwap\|` ≤ `vwap_proximity_pct` | ±0.1 % |
+| 2 | `rsi_min` ≤ RSI_14 ≤ `rsi_max` | 30 – 60 |
+| 3 | Volume ≥ `volume_factor` × rolling-average volume | 1.0 × |
+| 4 | Bullish candlestick pattern present (`pat_bull_signal == 1`) | required |
+
+### Quick start
+
+```python
+from scalpedge.ta_indicators import add_all_indicators
+from scalpedge.strategies import VWAPMeanReversionStrategy
+
+df = add_all_indicators(raw_df)          # adds vwap, rsi_14, atr_14, pat_bull_signal …
+
+strategy = VWAPMeanReversionStrategy(
+    vwap_proximity_pct=0.1,  # enter within ±0.1 % of VWAP
+    rsi_min=30.0,            # avoid deeply oversold traps
+    rsi_max=60.0,            # avoid overbought entries
+    volume_factor=1.0,       # require at-or-above-average volume
+    require_bull_candle=True,
+    atr_sl_mult=1.0,         # stop loss = entry − 1.0 × ATR_14
+    atr_tp_mult=1.5,         # take profit = entry + 1.5 × ATR_14
+    hold_bars=6,             # time exit after 30 min (6 × 5 min)
+)
+
+result = strategy.backtest(df, ticker="SPY", fee_pct=0.005, slippage_pct=0.005)
+print(result.summary())
+```
+
+### Combining with the market regime filter
+
+For extra robustness you can chain `VWAPMeanReversionStrategy` with the
+market regime filter via `HybridStrategy`'s `extra_rules` mechanism:
+
+```python
+from scalpedge.strategies import VWAPMeanReversionStrategy, HybridStrategy
+
+vwap_strat = VWAPMeanReversionStrategy(vwap_proximity_pct=0.15)
+
+strategy = HybridStrategy(
+    use_ml=False,
+    use_markov=False,
+    use_mc=False,
+    use_bs=False,
+    use_regime_filter=True,
+    spy_df=spy_df,
+    extra_rules=[vwap_strat.generate_signals],
+)
+signals = strategy.generate_signals(df)
+```
+
+---
+
 ## Layers Explained
 
 | Layer | Module | What it does |
@@ -315,7 +383,7 @@ uv run python main.py backtest TSLA AAPL NVDA
 | Options | `options.py` | Black-Scholes call/put, delta, gamma, vega, theta, rho, implied vol |
 | ML | `ml.py` | RandomForest + PyTorch LSTM → combined P(up) score; microstructure features (`spread_pct`, `bid_ask_imbalance`, `imbalance_ma_10`) included when available |
 | Backtester | `backtester.py` | Vectorized simulation, fee+slippage, equity curve, full metrics |
-| Strategies | `strategies.py` | TAStrategy (baseline) + HybridStrategy (all layers + optional catalyst suppression & market regime filters) |
+| Strategies | `strategies.py` | TAStrategy (baseline) + HybridStrategy (all layers + optional catalyst suppression & market regime filters) + VWAPMeanReversionStrategy (VWAP-anchored mean reversion with ATR exits) |
 
 ---
 
