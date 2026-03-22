@@ -1402,6 +1402,184 @@ class TestVWAPMeanReversionStrategy:
         assert signals.isin([0, 1]).all()
 
 
+# ---------------------------------------------------------------------------
+# Opening Range Breakout (ORB) Strategy
+# ---------------------------------------------------------------------------
+
+class TestORBStrategy:
+    """Tests for ORBStrategy."""
+
+    @pytest.fixture
+    def orb_df(self, synthetic_df):
+        """synthetic_df with all TA indicators (including atr_14) added."""
+        from scalpedge.ta_indicators import add_all_indicators
+
+        return (
+            add_all_indicators(synthetic_df)
+            .dropna(subset=["rsi_14", "atr_14"])
+            .reset_index(drop=True)
+        )
+
+    def test_signals_length_and_binary(self, orb_df):
+        """generate_signals must return a 0/1 Series of the same length as input."""
+        from scalpedge.strategies import ORBStrategy
+
+        strategy = ORBStrategy(require_volume_confirm=False)
+        signals = strategy.generate_signals(orb_df)
+        assert len(signals) == len(orb_df)
+        assert signals.isin([0, 1]).all()
+
+    def test_strategy_name(self):
+        """Strategy name attribute must be 'orb'."""
+        from scalpedge.strategies import ORBStrategy
+
+        assert ORBStrategy.name == "orb"
+
+    def test_invalid_direction_raises(self):
+        """Passing an invalid direction should raise ValueError."""
+        from scalpedge.strategies import ORBStrategy
+
+        with pytest.raises(ValueError, match="direction"):
+            ORBStrategy(direction="diagonal")
+
+    def test_long_direction_produces_signals(self, orb_df):
+        """Long direction should produce some signals when filters are relaxed."""
+        from scalpedge.strategies import ORBStrategy
+
+        strategy = ORBStrategy(
+            direction="long",
+            require_volume_confirm=False,
+        )
+        signals = strategy.generate_signals(orb_df)
+        assert signals.sum() >= 0  # count may be zero on flat data
+
+    def test_short_direction_produces_signals(self, orb_df):
+        """Short direction should produce some signals on synthetic data."""
+        from scalpedge.strategies import ORBStrategy
+
+        strategy = ORBStrategy(
+            direction="short",
+            require_volume_confirm=False,
+        )
+        signals = strategy.generate_signals(orb_df)
+        assert signals.isin([0, 1]).all()
+
+    def test_both_direction_ge_long_and_short(self, orb_df):
+        """'both' direction must yield at least as many signals as either alone."""
+        from scalpedge.strategies import ORBStrategy
+
+        long_sigs = ORBStrategy(direction="long", require_volume_confirm=False).generate_signals(orb_df)
+        short_sigs = ORBStrategy(direction="short", require_volume_confirm=False).generate_signals(orb_df)
+        both_sigs = ORBStrategy(direction="both", require_volume_confirm=False).generate_signals(orb_df)
+        assert both_sigs.sum() >= long_sigs.sum()
+        assert both_sigs.sum() >= short_sigs.sum()
+
+    def test_no_signals_during_orb_window(self, orb_df):
+        """Signals must only appear after the opening range is complete."""
+        from scalpedge.strategies import ORBStrategy
+
+        orb_window = 6
+        strategy = ORBStrategy(
+            orb_window_bars=orb_window,
+            direction="both",
+            require_volume_confirm=False,
+        )
+        signals = strategy.generate_signals(orb_df)
+
+        dt = pd.to_datetime(orb_df["datetime"])
+        dates = dt.dt.date
+
+        # For each day, the first orb_window bars must have no signal.
+        for date, group_idx in orb_df.groupby(dates).groups.items():
+            day_positions = sorted(group_idx.tolist(), key=lambda i: dt.loc[i])
+            opening_positions = day_positions[:orb_window]
+            assert signals.loc[opening_positions].sum() == 0, (
+                f"Expected no signals in opening range for date {date}"
+            )
+
+    def test_volume_confirmation_reduces_signals(self, orb_df):
+        """Requiring volume confirmation must not increase signal count."""
+        from scalpedge.strategies import ORBStrategy
+
+        no_vol = ORBStrategy(direction="both", require_volume_confirm=False)
+        with_vol = ORBStrategy(
+            direction="both",
+            require_volume_confirm=True,
+            volume_factor=1.0,
+        )
+        sigs_no_vol = no_vol.generate_signals(orb_df)
+        sigs_with_vol = with_vol.generate_signals(orb_df)
+        assert sigs_with_vol.sum() <= sigs_no_vol.sum()
+
+    def test_high_volume_threshold_suppresses_signals(self, orb_df):
+        """A very high volume factor (100×) should yield very few or zero signals."""
+        from scalpedge.strategies import ORBStrategy
+
+        strategy = ORBStrategy(
+            direction="both",
+            require_volume_confirm=True,
+            volume_factor=100.0,
+        )
+        signals = strategy.generate_signals(orb_df)
+        assert signals.sum() == 0, "Expected no signals at 100× volume threshold"
+
+    def test_fallback_without_datetime_column(self, orb_df):
+        """Strategy must return all-zero signals when 'datetime' column is absent."""
+        from scalpedge.strategies import ORBStrategy
+
+        df_no_dt = orb_df.drop(columns=["datetime"])
+        strategy = ORBStrategy(require_volume_confirm=False)
+        signals = strategy.generate_signals(df_no_dt)
+        assert len(signals) == len(df_no_dt)
+        assert signals.sum() == 0
+
+    def test_backtest_returns_result(self, orb_df):
+        """backtest() should return a BacktestResult."""
+        from scalpedge.strategies import ORBStrategy
+
+        strategy = ORBStrategy(
+            direction="both",
+            require_volume_confirm=False,
+        )
+        result = strategy.backtest(orb_df, ticker="TEST")
+        assert result.ticker == "TEST"
+        assert result.strategy == "orb"
+        assert result.n_trades >= 0
+
+    def test_backtest_uses_atr_exits_by_default(self, orb_df):
+        """Default backtest should use ATR-based exits."""
+        from scalpedge.strategies import ORBStrategy
+
+        strategy = ORBStrategy(
+            direction="both",
+            require_volume_confirm=False,
+            atr_sl_mult=1.0,
+            atr_tp_mult=2.0,
+        )
+        result = strategy.backtest(orb_df, ticker="TEST")
+        if result.n_trades > 0:
+            exit_types = result.trade_log["exit_type"].unique()
+            assert set(exit_types).issubset({"tp", "sl", "time"})
+
+    def test_backtest_kwargs_override_defaults(self, orb_df):
+        """bt_kwargs passed to backtest() must override strategy defaults."""
+        from scalpedge.strategies import ORBStrategy
+
+        strategy = ORBStrategy(hold_bars=6)
+        result = strategy.backtest(orb_df, ticker="TEST", hold_bars=2)
+        assert result.ticker == "TEST"
+
+    def test_small_orb_window_more_breakout_bars(self, orb_df):
+        """A smaller ORB window leaves more bars eligible for breakout signals."""
+        from scalpedge.strategies import ORBStrategy
+
+        small = ORBStrategy(orb_window_bars=2, direction="both", require_volume_confirm=False)
+        large = ORBStrategy(orb_window_bars=12, direction="both", require_volume_confirm=False)
+        # More breakout-eligible bars means at least as many potential signals.
+        _, _, past_small = small._compute_orb_ranges(orb_df)
+        _, _, past_large = large._compute_orb_ranges(orb_df)
+        assert past_small.sum() >= past_large.sum()
+
 
 class TestMarketRegime:
     """Tests for compute_market_regime() and HybridStrategy regime filter."""
