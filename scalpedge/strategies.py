@@ -257,6 +257,195 @@ class VWAPMeanReversionStrategy(BaseStrategy):
 
 
 # ---------------------------------------------------------------------------
+# Opening Range Breakout (ORB) strategy
+# ---------------------------------------------------------------------------
+
+class ORBStrategy(BaseStrategy):
+    """Opening Range Breakout (ORB) strategy for intraday trading.
+
+    The strategy identifies the high/low of the first *orb_window_bars* bars
+    of each trading day (the "opening range").  After the opening range closes,
+    a breakout signal is generated when price moves beyond the range:
+
+    * **Long signal** — ``close > orb_high`` (price breaks above the range).
+    * **Short signal** — ``close < orb_low`` (price breaks below the range).
+    * **Both** — either condition triggers a signal.
+
+    An optional volume confirmation gate requires the bar volume to be at
+    least *volume_factor* × the rolling *volume_ma_bars*-bar average volume.
+
+    ATR-based stop-loss and take-profit exits are applied automatically by
+    :meth:`backtest` using *atr_sl_mult* × ATR_14 and *atr_tp_mult* × ATR_14
+    relative to the entry price.
+
+    Works best on liquid intraday instruments (SPY, QQQ, NVDA, etc.) at the
+    5-minute bar level.  Requires a ``datetime`` column in the input DataFrame
+    so that days can be identified.
+
+    Parameters
+    ----------
+    orb_window_bars:
+        Number of bars that define the opening range (default 6 = 30 min at
+        5-minute bars).
+    direction:
+        ``"long"`` to signal upward breakouts only, ``"short"`` for downward
+        breakouts only, or ``"both"`` to signal in either direction
+        (default ``"long"``).
+    require_volume_confirm:
+        When ``True`` (default), the breakout bar must have volume at least
+        *volume_factor* × the rolling *volume_ma_bars*-bar average.
+    volume_ma_bars:
+        Rolling window (in bars) for the volume baseline (default 20).
+    volume_factor:
+        Minimum ratio of current bar volume to rolling average required for
+        entry (default 1.0).
+    atr_sl_mult:
+        ATR multiplier for the stop-loss distance below entry (default 1.0).
+    atr_tp_mult:
+        ATR multiplier for the take-profit distance above entry (default 2.0).
+    hold_bars:
+        Maximum holding period in bars before a time-based exit fires
+        (default 6, i.e. 30 minutes at 5-minute bars).
+    """
+
+    name = "orb"
+
+    def __init__(
+        self,
+        orb_window_bars: int = 6,
+        direction: str = "long",
+        require_volume_confirm: bool = True,
+        volume_ma_bars: int = 20,
+        volume_factor: float = 1.0,
+        atr_sl_mult: float = 1.0,
+        atr_tp_mult: float = 2.0,
+        hold_bars: int = 6,
+    ) -> None:
+        if direction not in ("long", "short", "both"):
+            raise ValueError("direction must be 'long', 'short', or 'both'")
+        self.orb_window_bars = orb_window_bars
+        self.direction = direction
+        self.require_volume_confirm = require_volume_confirm
+        self.volume_ma_bars = volume_ma_bars
+        self.volume_factor = volume_factor
+        self.atr_sl_mult = atr_sl_mult
+        self.atr_tp_mult = atr_tp_mult
+        self.hold_bars = hold_bars
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _compute_orb_ranges(
+        self,
+        df: pd.DataFrame,
+    ) -> tuple[pd.Series, pd.Series, pd.Series]:
+        """Compute per-day opening range high/low and a post-ORB mask.
+
+        Parameters
+        ----------
+        df:
+            OHLCV DataFrame with a ``datetime`` column.
+
+        Returns
+        -------
+        orb_high : pd.Series
+            Opening range high broadcast to all post-ORB bars of each day;
+            NaN for bars inside or before the opening range.
+        orb_low : pd.Series
+            Opening range low, same layout as *orb_high*.
+        past_orb : pd.Series[bool]
+            ``True`` for every bar that falls after the opening range of its
+            trading day (i.e. bars eligible to trigger a breakout signal).
+        """
+        dt = pd.to_datetime(df["datetime"])
+        dates = dt.dt.date
+
+        orb_high = pd.Series(np.nan, index=df.index, dtype=float)
+        orb_low = pd.Series(np.nan, index=df.index, dtype=float)
+        past_orb = pd.Series(False, index=df.index)
+
+        for date, group_idx in df.groupby(dates).groups.items():
+            # Sort positions by bar time so we always use the earliest bars.
+            day_positions = sorted(group_idx.tolist(), key=lambda i: dt.loc[i])
+
+            if len(day_positions) <= self.orb_window_bars:
+                # Not enough bars in this day to form a breakout zone.
+                continue
+
+            opening_bars = day_positions[: self.orb_window_bars]
+            day_high = df.loc[opening_bars, "high"].max()
+            day_low = df.loc[opening_bars, "low"].min()
+
+            breakout_bars = day_positions[self.orb_window_bars :]
+            orb_high.loc[breakout_bars] = day_high
+            orb_low.loc[breakout_bars] = day_low
+            past_orb.loc[breakout_bars] = True
+
+        return orb_high, orb_low, past_orb
+
+    # ------------------------------------------------------------------
+
+    def generate_signals(self, df: pd.DataFrame) -> pd.Series:
+        """Return a 0/1 entry signal Series aligned with *df*.
+
+        Each ``1`` marks a bar where the opening range breakout condition and
+        (optionally) the volume confirmation are met.
+        """
+        if "datetime" not in df.columns:
+            logger.warning(
+                "ORBStrategy: 'datetime' column not found; returning all-zero signals."
+            )
+            return pd.Series(0, index=df.index)
+
+        c = df["close"].astype(float)
+
+        orb_high, orb_low, past_orb = self._compute_orb_ranges(df)
+
+        # ----------------------------------------------------------------
+        # Breakout conditions
+        # ----------------------------------------------------------------
+        long_breakout = past_orb & (c > orb_high)
+        short_breakout = past_orb & (c < orb_low)
+
+        if self.direction == "long":
+            breakout = long_breakout
+        elif self.direction == "short":
+            breakout = short_breakout
+        else:  # "both"
+            breakout = long_breakout | short_breakout
+
+        # ----------------------------------------------------------------
+        # Optional volume confirmation
+        # ----------------------------------------------------------------
+        if self.require_volume_confirm:
+            v = df["volume"].astype(float)
+            vol_ma = v.rolling(self.volume_ma_bars, min_periods=1).mean()
+            vol_ok = v >= self.volume_factor * vol_ma
+            breakout = breakout & vol_ok
+
+        return breakout.astype(int)
+
+    def backtest(
+        self,
+        df: pd.DataFrame,
+        ticker: str = "UNKNOWN",
+        **bt_kwargs,
+    ) -> BacktestResult:
+        """Generate signals and run the backtester with ATR exits.
+
+        The strategy's *hold_bars*, *atr_sl_mult*, and *atr_tp_mult* are used
+        as defaults.  They can be overridden via *bt_kwargs*.  The ``atr_14``
+        column from *df* is automatically used as the ATR series unless an
+        explicit ``atr`` kwarg is provided.
+        """
+        bt_kwargs.setdefault("hold_bars", self.hold_bars)
+        bt_kwargs.setdefault("atr_sl_mult", self.atr_sl_mult)
+        bt_kwargs.setdefault("atr_tp_mult", self.atr_tp_mult)
+        return super().backtest(df, ticker=ticker, **bt_kwargs)
+
+
+# ---------------------------------------------------------------------------
 # Hybrid strategy (all layers combined)
 # ---------------------------------------------------------------------------
 
