@@ -128,6 +128,7 @@ class LiveSignalEngine:
         tickers: list[str],
         strategy,
         on_signal: Callable[[SignalEvent], None] | None = None,
+        on_bar_update: Callable[[str, dict, int], None] | None = None,
         buffer_size: int = 500,
         api_key: str | None = None,
         subscriptions: list[str] | None = None,
@@ -135,6 +136,7 @@ class LiveSignalEngine:
         self.tickers = [t.upper() for t in tickers]
         self.strategy = strategy
         self.on_signal = on_signal
+        self.on_bar_update = on_bar_update
         self.buffer_size = buffer_size
         self.api_key = api_key
         self.subscriptions = subscriptions or ["AM.*"]
@@ -326,6 +328,13 @@ class LiveSignalEngine:
                 result = self.on_signal(event)
                 if asyncio.iscoroutine(result):
                     await result
+
+        # --- Step 7: notify bar-update listener (every bar, regardless of signal) ---
+        if self.on_bar_update is not None:
+            bar_dict = df.iloc[-1].to_dict()
+            result = self.on_bar_update(ticker, bar_dict, last_signal)
+            if asyncio.iscoroutine(result):
+                await result
 
 
 # ---------------------------------------------------------------------------
