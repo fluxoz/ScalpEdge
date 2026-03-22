@@ -24,6 +24,12 @@ Usage
     uv run python main.py scan SPY TSLA AAPL NVDA QQQ
     uv run python main.py scan --top 20                 # top 20 by absolute change %
 
+    # Live signal engine + TUI dashboard (requires POLYGON_API_KEY):
+    uv run python main.py live SPY TSLA NVDA            # TUI dashboard (default when textual installed)
+    uv run python main.py live --no-dashboard           # plain stdout fallback (no TUI)
+    uv run python main.py live SPY --no-ml              # disable ML scoring layer
+    uv run python main.py live SPY --buffer-size 200    # keep 200 bars in rolling buffer
+
 The ``data/`` directory is auto-created and grows on every run.
 """
 
@@ -76,6 +82,8 @@ _HAS_ML = (
     importlib.util.find_spec("sklearn") is not None
     and importlib.util.find_spec("torch") is not None
 )
+
+_HAS_TUI = importlib.util.find_spec("textual") is not None
 
 # ---------------------------------------------------------------------------
 # Tickers to backtest — add any ticker here to extend coverage.
@@ -316,6 +324,21 @@ def _print_signal(event) -> None:
     print(str(event))
 
 
+def _redirect_logs_to_file(path: str) -> None:
+    """Redirect all logging output to *path* to keep the TUI terminal clean."""
+    root = logging.getLogger()
+    for handler in root.handlers[:]:
+        root.removeHandler(handler)
+    file_handler = logging.FileHandler(path)
+    file_handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+            datefmt="%H:%M:%S",
+        )
+    )
+    root.addHandler(file_handler)
+
+
 def cmd_live(args: argparse.Namespace) -> None:
     """Seed historical buffer, fit strategy, then stream live bars from Polygon."""
     import asyncio
@@ -327,11 +350,14 @@ def cmd_live(args: argparse.Namespace) -> None:
 
     tickers: list[str] = [t.upper() for t in args.tickers] if args.tickers else TICKERS
 
-    use_ml_live = _HAS_ML and not getattr(args, "no_ml", False)
+    use_ml_live  = _HAS_ML and not getattr(args, "no_ml", False)
     buffer_size: int = getattr(args, "buffer_size", 500) or 500
+    use_dashboard = _HAS_TUI and not getattr(args, "no_dashboard", False)
 
-    logger.info("Live engine starting — tickers=%s  use_ml=%s  buffer_size=%d",
-                tickers, use_ml_live, buffer_size)
+    logger.info(
+        "Live engine starting — tickers=%s  use_ml=%s  buffer_size=%d  dashboard=%s",
+        tickers, use_ml_live, buffer_size, use_dashboard,
+    )
 
     dm = DataManager()
 
@@ -376,27 +402,28 @@ def cmd_live(args: argparse.Namespace) -> None:
     # 2. Fit HybridStrategy on 80% of historical data
     # ------------------------------------------------------------------
     use_regime = spy_df is not None and any(t != "SPY" for t in tickers)
-    hybrid_cfg = dict(
+    hybrid_cfg = {
         **HYBRID_CONFIG,
-        use_ml=use_ml_live,
-        use_regime_filter=use_regime,
-        spy_df=spy_df if use_regime else None,
-        regime_lookback=5,
-    )
+        "use_ml": use_ml_live,
+        "use_regime_filter": use_regime,
+        "spy_df": spy_df if use_regime else None,
+        "regime_lookback": 5,
+    }
     strategy = HybridStrategy(**hybrid_cfg)
 
-    split = int(len(primary_df) * 0.80)
+    split    = int(len(primary_df) * 0.80)
     train_df = primary_df.iloc[:split]
     logger.info("[%s] Fitting ML models on %d bars …", primary_ticker, len(train_df))
     strategy.fit_ml(train_df)
 
     # ------------------------------------------------------------------
-    # 3. Create engine, seed buffers, and run
+    # 3. Create engine and seed buffers
     # ------------------------------------------------------------------
     engine = LiveSignalEngine(
         tickers=tickers,
         strategy=strategy,
-        on_signal=_print_signal,
+        # Callbacks are wired by the dashboard; stdout fallback otherwise.
+        on_signal=None if use_dashboard else _print_signal,
         buffer_size=buffer_size,
         api_key=getattr(args, "api_key", None) or None,
     )
@@ -404,7 +431,16 @@ def cmd_live(args: argparse.Namespace) -> None:
     for ticker, df in ticker_dfs.items():
         engine.seed(ticker, df)
 
-    asyncio.run(engine.run())
+    # ------------------------------------------------------------------
+    # 4. Launch TUI dashboard or plain asyncio loop
+    # ------------------------------------------------------------------
+    if use_dashboard:
+        # Redirect logs to a file — the TUI owns the terminal.
+        _redirect_logs_to_file("scalpedge_live.log")
+        from scalpedge.dashboard import ScalpEdgeDashboard
+        ScalpEdgeDashboard(tickers=tickers, engine=engine).run()
+    else:
+        asyncio.run(engine.run())
 
 
 def _plot_equity(result, ticker: str) -> None:
@@ -571,6 +607,16 @@ def main() -> None:
         dest="buffer_size",
         metavar="N",
         help="Number of bars to keep in the rolling buffer per ticker (default: 500).",
+    )
+    live_parser.add_argument(
+        "--no-dashboard",
+        action="store_true",
+        dest="no_dashboard",
+        default=False,
+        help=(
+            "Print signals to stdout instead of launching the TUI dashboard. "
+            "The dashboard launches automatically when textual is installed."
+        ),
     )
 
     args = parser.parse_args()
