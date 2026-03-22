@@ -2096,3 +2096,251 @@ class TestCatalystFilter:
         filtered = strategy._apply_catalyst_filter(signal, df)
         # All bars are on 2024-01-15, so all should be 0.
         assert (filtered == 0).all()
+
+
+# ---------------------------------------------------------------------------
+# LiveSignalEngine + SignalEvent
+# ---------------------------------------------------------------------------
+
+class TestLiveEngine:
+    """Tests for LiveSignalEngine and SignalEvent (no network required)."""
+
+    @pytest.fixture
+    def _strategy(self, clean_df):
+        from scalpedge.strategies import HybridStrategy
+
+        strategy = HybridStrategy(use_ml=False, use_markov=True, use_mc=True, use_bs=True)
+        split = int(len(clean_df) * 0.8)
+        strategy.fit_ml(clean_df.iloc[:split])
+        return strategy
+
+    # --- SignalEvent tests ---
+
+    def test_signal_event_str(self):
+        """__str__ should format the signal with emoji, ticker, price, and indicator summary."""
+        from scalpedge.live_engine import SignalEvent
+
+        evt = SignalEvent(
+            ticker="SPY",
+            bar_time=pd.Timestamp("2026-03-22 10:35", tz="UTC"),
+            price=519.84,
+            signal=1,
+            indicators={
+                "rsi_14": 52.3,
+                "macd": 0.14,
+                "adx_14": 28.4,
+                "vwap": 519.57,
+                "ema_9": 519.60,
+                "ema_21": 519.40,
+                "atr_14": 1.2,
+            },
+            strategy_name="hybrid",
+        )
+        s = str(evt)
+        assert "🟢 LONG SIGNAL" in s
+        assert "SPY" in s
+        assert "519.84" in s
+        assert "RSI" in s
+        assert "MACD" in s
+
+    def test_signal_event_str_missing_indicators(self):
+        """__str__ should not crash when indicators are missing or None."""
+        from scalpedge.live_engine import SignalEvent
+
+        evt = SignalEvent(
+            ticker="TEST",
+            bar_time=pd.Timestamp("2026-01-01", tz="UTC"),
+            price=100.0,
+            signal=1,
+            indicators={},
+        )
+        s = str(evt)
+        assert "TEST" in s
+        assert "100.00" in s
+
+    # --- LiveSignalEngine construction ---
+
+    def test_engine_init(self, _strategy):
+        """Engine should initialise buffers for all tickers."""
+        from scalpedge.live_engine import LiveSignalEngine
+
+        engine = LiveSignalEngine(["SPY", "TSLA"], _strategy, buffer_size=200)
+        assert "SPY" in engine._buffers
+        assert "TSLA" in engine._buffers
+        assert engine.buffer_size == 200
+
+    def test_seed_populates_buffer(self, _strategy, clean_df):
+        """seed() should load historical rows into the deque."""
+        from scalpedge.live_engine import LiveSignalEngine
+
+        engine = LiveSignalEngine(["TEST"], _strategy, buffer_size=500)
+        engine.seed("TEST", clean_df)
+
+        buf = engine.get_buffer("TEST")
+        assert not buf.empty
+        assert len(buf) == min(len(clean_df), 500)
+
+    def test_seed_case_insensitive(self, _strategy, clean_df):
+        """seed() should accept lowercase ticker symbols."""
+        from scalpedge.live_engine import LiveSignalEngine
+
+        engine = LiveSignalEngine(["TEST"], _strategy)
+        engine.seed("test", clean_df)  # lowercase
+
+        buf = engine.get_buffer("TEST")
+        assert not buf.empty
+
+    def test_get_buffer_empty_on_unknown_ticker(self, _strategy):
+        """get_buffer() should return an empty DataFrame for an unknown ticker."""
+        from scalpedge.live_engine import LiveSignalEngine
+
+        engine = LiveSignalEngine(["SPY"], _strategy)
+        buf = engine.get_buffer("AAPL")
+        assert buf.empty
+
+    # --- _on_bar robustness ---
+
+    def test_on_bar_skips_missing_ohlcv(self, _strategy, clean_df):
+        """_on_bar should skip bars where any OHLCV field is None."""
+        from scalpedge.live_engine import LiveSignalEngine
+
+        engine = LiveSignalEngine(["TEST"], _strategy, buffer_size=500)
+        engine.seed("TEST", clean_df)
+        buf_before = len(engine._buffers["TEST"])
+
+        bad_bar = {
+            "ticker": "TEST",
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": None,  # missing
+            "volume": 1000,
+            "datetime": pd.Timestamp.now(tz="UTC"),
+        }
+
+        import asyncio
+        asyncio.run(engine._on_bar(bad_bar))
+
+        # Buffer length should be unchanged (bar was skipped).
+        assert len(engine._buffers["TEST"]) == buf_before
+
+    def test_on_bar_skips_unknown_ticker(self, _strategy, clean_df):
+        """_on_bar should silently ignore bars for tickers not in the engine."""
+        from scalpedge.live_engine import LiveSignalEngine
+
+        engine = LiveSignalEngine(["TEST"], _strategy, buffer_size=500)
+
+        bar = {
+            "ticker": "AAPL",
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.5,
+            "volume": 1000,
+            "datetime": pd.Timestamp.now(tz="UTC"),
+        }
+
+        import asyncio
+        asyncio.run(engine._on_bar(bar))  # should not raise
+
+    def test_on_bar_appends_to_buffer(self, _strategy, clean_df):
+        """Valid bar should be appended to the per-ticker buffer."""
+        from scalpedge.live_engine import LiveSignalEngine
+
+        engine = LiveSignalEngine(["TEST"], _strategy, buffer_size=500)
+        engine.seed("TEST", clean_df.iloc[:100])  # seed with 100 rows
+        buf_before = len(engine._buffers["TEST"])
+
+        row = clean_df.iloc[100].to_dict()
+        row["ticker"] = "TEST"
+
+        import asyncio
+        asyncio.run(engine._on_bar(row))
+
+        assert len(engine._buffers["TEST"]) == buf_before + 1
+
+    def test_on_bar_emits_signal_callback(self, _strategy, clean_df):
+        """When generate_signals returns 1 on the last bar, on_signal should fire."""
+        from scalpedge.live_engine import LiveSignalEngine, SignalEvent
+        import unittest.mock as mock
+
+        # Seed with data that will guarantee a signal by mocking generate_signals
+        signals_seen = []
+        engine = LiveSignalEngine(["TEST"], _strategy, on_signal=lambda e: signals_seen.append(e))
+        engine.seed("TEST", clean_df.iloc[:400])
+
+        with mock.patch.object(_strategy, "generate_signals") as mock_gen:
+            # Force signal = 1 on the last row
+            def make_signals(df):
+                s = pd.Series(0, index=df.index)
+                s.iloc[-1] = 1
+                return s
+            mock_gen.side_effect = make_signals
+
+            row = clean_df.iloc[400].to_dict()
+            row["ticker"] = "TEST"
+            import asyncio
+            asyncio.run(engine._on_bar(row))
+
+        assert len(signals_seen) == 1
+        assert isinstance(signals_seen[0], SignalEvent)
+        assert signals_seen[0].ticker == "TEST"
+        assert signals_seen[0].signal == 1
+
+    def test_on_bar_no_crash_on_indicator_failure(self, _strategy):
+        """_on_bar should not crash when add_all_indicators raises (tiny buffer)."""
+        from scalpedge.live_engine import LiveSignalEngine
+
+        engine = LiveSignalEngine(["TEST"], _strategy, buffer_size=500)
+        # Buffer is empty — add_all_indicators will have nothing but won't raise
+
+        row = {
+            "ticker": "TEST",
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.5,
+            "volume": 1000,
+            "datetime": pd.Timestamp.now(tz="UTC"),
+        }
+
+        import asyncio
+        asyncio.run(engine._on_bar(row))  # should not raise
+
+    def test_on_bar_no_crash_on_generate_signals_failure(self, _strategy, clean_df):
+        """_on_bar should not crash when generate_signals raises."""
+        from scalpedge.live_engine import LiveSignalEngine
+        import unittest.mock as mock
+
+        engine = LiveSignalEngine(["TEST"], _strategy, buffer_size=500)
+        engine.seed("TEST", clean_df.iloc[:400])
+
+        with mock.patch.object(_strategy, "generate_signals", side_effect=RuntimeError("boom")):
+            row = clean_df.iloc[400].to_dict()
+            row["ticker"] = "TEST"
+            import asyncio
+            asyncio.run(engine._on_bar(row))  # should not raise
+
+    # --- buffer_size rolling window ---
+
+    def test_buffer_respects_maxlen(self, _strategy, clean_df):
+        """Rolling buffer must not exceed buffer_size rows."""
+        from scalpedge.live_engine import LiveSignalEngine
+
+        engine = LiveSignalEngine(["TEST"], _strategy, buffer_size=50)
+        engine.seed("TEST", clean_df.iloc[:200])  # seed with more than 50 rows
+        assert len(engine._buffers["TEST"]) == 50
+
+    # --- _safe_float helper ---
+
+    def test_safe_float(self):
+        """_safe_float should handle None, NaN, inf, and valid numbers."""
+        from scalpedge.live_engine import _safe_float
+        import math
+
+        assert _safe_float(None) is None
+        assert _safe_float(float("nan")) is None
+        assert _safe_float(float("inf")) is None
+        assert _safe_float(1.5) == 1.5
+        assert _safe_float("2.0") == 2.0
+        assert _safe_float("bad") is None
