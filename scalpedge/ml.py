@@ -556,8 +556,26 @@ class MLEngine:
                 self.rf.last_fit_dt,
                 self.lstm.last_fit_dt,
             )
+
+        rf_fitted = self.rf._fitted
+        lstm_fitted = self.lstm._fitted
+
+        if not rf_fitted and not lstm_fitted:
+            # Neither model could be fitted (e.g. ML libraries not installed).
+            # Return a pass-through score so the ML layer does not block signals.
+            logger.warning(
+                "MLEngine: neither RF nor LSTM is fitted — returning pass-through scores."
+            )
+            return pd.Series(1.0, index=df.index, name="ml_score")
+
         w_rf, w_lstm = weights
         rf_prob = self.rf.predict_proba(df)
         lstm_prob = self.lstm.predict_proba(df)
+
+        if rf_fitted and not lstm_fitted:
+            return pd.Series(rf_prob, index=df.index, name="ml_score")
+        if lstm_fitted and not rf_fitted:
+            return pd.Series(lstm_prob, index=df.index, name="ml_score")
+
         combined = w_rf * rf_prob + w_lstm * lstm_prob
         return pd.Series(combined, index=df.index, name="ml_score")

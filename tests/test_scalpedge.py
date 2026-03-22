@@ -1199,6 +1199,68 @@ class TestStrategies:
         assert len(signals) == len(clean_df)
         assert signals.isin([0, 1]).all()
 
+    def test_hybrid_generates_trades_on_flat_market(self):
+        """Regression: MC filter must not block all trades on flat/bearish data.
+
+        The old global-scalar MC filter would return False for every bar when
+        P(12-bar > threshold) < 0.5, which happens for any flat or downtrending
+        market.  The rolling-window fix ensures the filter adapts locally.
+        """
+        from scalpedge.ta_indicators import add_all_indicators
+        from scalpedge.strategies import HybridStrategy
+
+        # Build a downward-trending dataset (negative drift) — the bug scenario.
+        np.random.seed(0)
+        n = 500
+        close = 450.0 * np.cumprod(1 + np.random.normal(-0.0003, 0.002, n))
+        df = pd.DataFrame(
+            {
+                "datetime": pd.date_range(
+                    "2024-01-02 09:30", periods=n, freq="5min", tz="UTC"
+                ),
+                "open": close * (1 + np.random.normal(0, 0.001, n)),
+                "high": close * (1 + np.abs(np.random.normal(0, 0.002, n))),
+                "low": close * (1 - np.abs(np.random.normal(0, 0.002, n))),
+                "close": close,
+                "volume": np.random.randint(100_000, 500_000, n).astype(float),
+                "ticker": "TEST",
+            }
+        )
+        df["high"] = df[["high", "close", "open"]].max(axis=1)
+        df["low"] = df[["low", "close", "open"]].min(axis=1)
+        df = add_all_indicators(df)
+        df = df.dropna(subset=["ema_50", "rsi_14", "macd", "atr_14"]).reset_index(drop=True)
+
+        strategy = HybridStrategy(
+            use_ml=False, use_markov=True, use_mc=True, use_bs=True,
+            mc_n_simulations=100,
+        )
+        result = strategy.backtest(df, ticker="TEST",
+                                   fee_pct=0.005, slippage_pct=0.01, hold_bars=3)
+        # With the rolling MC fix, the strategy should generate some trades even
+        # on a downward-trending dataset (TA + Markov signals still fire).
+        assert result.n_trades > 0, (
+            "Hybrid strategy generated 0 trades on flat/bearish data — "
+            "MC filter may be incorrectly blocking all signals."
+        )
+
+    def test_ml_engine_score_passthrough_when_unfitted(self):
+        """Regression: unfitted MLEngine must return pass-through scores (== 1.0).
+
+        Previously both unfitted sub-models returned 0.5, giving a combined
+        score of 0.5, which fell below the default ml_score_threshold of 0.52
+        and blocked every signal.
+        """
+        from scalpedge.ml import MLEngine
+
+        engine = MLEngine()
+        df = pd.DataFrame({"close": np.linspace(100, 110, 50)})
+        scores = engine.score(df)
+        assert (scores == 1.0).all(), (
+            "Unfitted MLEngine.score() must return exactly 1.0 (pass-through), "
+            "not 0.5 which blocks signals below the default threshold."
+        )
+
     @_skip_no_ml
     def test_hybrid_with_ml(self, clean_df):
         from scalpedge.strategies import HybridStrategy
