@@ -505,6 +505,9 @@ class HybridStrategy(BaseStrategy):
     regime_lookback:
         Rolling-window size (in bars) for the VWAP trend calculation
         (default 5).
+    mc_rolling_window:
+        Number of bars used to estimate local drift and volatility in the
+        rolling MC filter (default 60, i.e. ~5 hours at 5-minute bars).
     """
 
     name = "hybrid"
@@ -514,7 +517,7 @@ class HybridStrategy(BaseStrategy):
         markov_order: int = 2,
         mc_n_simulations: int = 1000,
         mc_n_bars: int = 12,
-        mc_threshold_pct: float = 0.3,
+        mc_threshold_pct: float = 0.0,
         markov_up_threshold: float = 0.38,
         ml_score_threshold: float = 0.52,
         bs_min_delta: float = 0.40,
@@ -531,6 +534,7 @@ class HybridStrategy(BaseStrategy):
         use_regime_filter: bool = False,
         spy_df: pd.DataFrame | None = None,
         regime_lookback: int = 5,
+        mc_rolling_window: int = 60,
     ) -> None:
         self.markov_order = markov_order
         self.mc_n_simulations = mc_n_simulations
@@ -552,6 +556,7 @@ class HybridStrategy(BaseStrategy):
         self.use_regime_filter = use_regime_filter
         self.spy_df = spy_df
         self.regime_lookback = regime_lookback
+        self.mc_rolling_window = mc_rolling_window
 
         self._markov = MarkovChain(order=markov_order)
         self._mc = MonteCarlo(n_simulations=mc_n_simulations)
@@ -664,18 +669,35 @@ class HybridStrategy(BaseStrategy):
         return result
 
     def _mc_filter(self, close: pd.Series) -> pd.Series:
-        """Return True where Monte Carlo P(up) >= 0.5."""
-        log_rets = np.log(close / close.shift(1)).dropna()
-        if len(log_rets) < 20:
-            return pd.Series(True, index=close.index)
-        # Use all available history to estimate drift + vol.
-        prob_up = self._mc.prob_up(
-            log_rets,
-            n_bars=self.mc_n_bars,
-            threshold_pct=self.mc_threshold_pct,
-        )
-        # Scalar filter — apply uniformly (can be made rolling if desired).
-        return pd.Series(prob_up >= 0.5, index=close.index)
+        """Return True where rolling Monte Carlo P(up) >= 0.5.
+
+        Uses a ``mc_rolling_window``-bar rolling window to estimate local drift
+        and volatility, then applies an analytical normal approximation for the
+        probability that the cumulative return over ``mc_n_bars`` bars exceeds
+        ``mc_threshold_pct`` %.  Bars with insufficient rolling history
+        (fewer than 20 observations) default to True (no filtering).
+        """
+        from scipy.stats import norm as _norm
+
+        log_rets = np.log(close / close.shift(1))
+        window = self.mc_rolling_window
+
+        roll_mu = log_rets.rolling(window, min_periods=20).mean()
+        # Clip sigma away from zero to prevent division by zero in the z-score.
+        roll_sigma = log_rets.rolling(window, min_periods=20).std().clip(lower=1e-10)
+
+        threshold = self.mc_threshold_pct / 100.0
+        n = self.mc_n_bars
+
+        # P(sum of n returns > threshold) ≈ 1 − Φ(z) where
+        # z = (threshold − n·μ) / (√n · σ)
+        z = (threshold - n * roll_mu) / (np.sqrt(n) * roll_sigma)
+        prob_up = pd.Series(1.0 - _norm.cdf(z.values), index=close.index)
+
+        # Rows without enough rolling history pass through unconditionally.
+        prob_up = prob_up.where(roll_mu.notna(), other=1.0)
+
+        return (prob_up >= 0.5).astype(bool)
 
     def _bs_filter(self, close: pd.Series) -> pd.Series:
         """Return True where ATM 0DTE call delta >= bs_min_delta.
