@@ -30,6 +30,8 @@ _FEATURE_COLS = [
     "price_vs_vwap",
     "ema_9", "ema_21", "ema_50",
     "pat_bull_signal", "pat_bear_signal",
+    # Bid-ask microstructure features (present when quote data is joined)
+    "spread_pct", "bid_ask_imbalance", "imbalance_ma_10",
 ]
 
 

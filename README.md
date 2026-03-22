@@ -16,6 +16,9 @@ Combines:
 - **Black-Scholes** 0DTE option pricing & delta filter
 - **RandomForest + LSTM** ML hybrid score
 - **Vectorized backtester** with realistic fees, slippage, and full metrics
+- **Bid-ask microstructure features** from NBBO quote data (spread, imbalance)
+- **Catalyst suppression filter** to avoid trading around earnings/events
+- **Real-time WebSocket streaming** via Polygon Stocks Advanced
 
 ---
 
@@ -24,18 +27,21 @@ Combines:
 ### Data Source — Polygon.io (recommended)
 
 ScalpEdge uses **Polygon.io** as the primary market data source.
-Sign up for a free key at <https://polygon.io/> and export it before running:
+Sign up for a **Stocks Advanced** key at <https://polygon.io/> and export it before running:
 
 ```bash
 export POLYGON_API_KEY="your_key_here"
 ```
 
-Free tier limits observed by the client:
+Stocks Advanced plan limits observed by the client:
 
 | Limit | Value |
 |---|---|
-| API calls/minute | 5 |
-| Historical minute data | 2 years |
+| API calls/minute | Unlimited |
+| Historical minute data | 5+ years |
+| Tick-level trades & quotes | ✅ (v3/trades, v3/quotes) |
+| Market snapshots | ✅ (whole market or per-ticker) |
+| WebSocket streaming | ✅ (real-time bars & trades) |
 | Coverage | All US stocks |
 
 > **Fallback** — if `POLYGON_API_KEY` is not set, ScalpEdge falls back to
@@ -54,7 +60,10 @@ uv sync
 # 3. (Optional) Install ML dependencies (scikit-learn + PyTorch)
 uv sync --extra ml
 
-# 4. Run the full backtest
+# 4. (Optional) Install streaming dependencies (websockets)
+uv sync --extra streaming
+
+# 5. Run the full backtest
 uv run python main.py
 ```
 
@@ -62,16 +71,19 @@ uv run python main.py
 
 ```bash
 # Requires Python 3.12+ and uv installed
-uv sync                  # core deps only
-uv sync --extra ml       # + ML layer (optional)
+uv sync                      # core deps only
+uv sync --extra ml           # + ML layer (optional)
+uv sync --extra streaming    # + WebSocket streaming (optional)
 uv run python main.py
 ```
 
 ### Option C — plain pip
 
 ```bash
-pip install -e "."       # core deps only
-pip install -e ".[ml]"   # + ML layer (optional)
+pip install -e "."                        # core deps only
+pip install -e ".[ml]"                    # + ML layer (optional)
+pip install -e ".[streaming]"             # + WebSocket streaming (optional)
+pip install -e ".[ml,streaming]"          # everything
 python main.py
 ```
 
@@ -90,12 +102,12 @@ ScalpEdge/
 └── scalpedge/
     ├── __init__.py
     ├── data.py              # Data management: fetch, store, auto-append (Polygon/yfinance + Parquet)
-    ├── ta_indicators.py     # 20+ TA indicators + 60+ candlestick patterns (vectorized)
+    ├── ta_indicators.py     # 20+ TA indicators + 60+ candlestick patterns + microstructure features
     ├── probabilities.py     # Monte Carlo + Markov chain (order-2)
     ├── options.py           # Black-Scholes pricing, Greeks, implied vol
     ├── ml.py                # RandomForest + PyTorch LSTM + MLEngine
     ├── backtester.py        # Vectorized backtester + full performance metrics
-    └── strategies.py        # TAStrategy (baseline) + HybridStrategy (all layers)
+    └── strategies.py        # TAStrategy (baseline) + HybridStrategy (all layers + catalyst filter)
 ```
 
 ---
@@ -120,6 +132,60 @@ ScalpEdge/
 ```
 
 An equity curve PNG is also saved to `data/<TICKER>_equity_curve.png`.
+
+---
+
+## Market Scanner
+
+Use the `scan` sub-command to pull a live snapshot table via Polygon Stocks Advanced:
+
+```bash
+# Scan the whole market (sorted by absolute change %):
+uv run python main.py scan
+
+# Scan specific tickers:
+uv run python main.py scan SPY TSLA AAPL NVDA QQQ
+
+# Top 20 movers:
+uv run python main.py scan --top 20
+```
+
+Example output:
+```
+TICKER    LAST PRICE    CHANGE %      DAY VOLUME    PREV CLOSE
+--------------------------------------------------------------------
+NVDA         878.35      +4.27%    42,103,200         842.75
+TSLA         185.50      -2.13%    89,234,100         189.53
+SPY          519.12      +0.52%   102,000,000         516.43
+```
+
+---
+
+## WebSocket Streaming
+
+Stream real-time bars and trades via Polygon's WebSocket API (Stocks Advanced required):
+
+```python
+import asyncio
+from scalpedge.data import PolygonStream
+
+async def handle_bar(bar: dict) -> None:
+    print(f"[{bar['ticker']}] {bar['datetime']}  O={bar['open']}  C={bar['close']}  V={bar['volume']}")
+
+async def handle_trade(trade: dict) -> None:
+    print(f"[{trade['ticker']}] trade @ {trade['price']} x {trade['size']}")
+
+stream = PolygonStream(
+    tickers=["SPY", "TSLA"],
+    on_bar=handle_bar,
+    on_trade=handle_trade,
+    subscriptions=["AM.*", "T.*"],   # per-minute bars + trade ticks
+)
+
+asyncio.run(stream.run())
+```
+
+The stream reconnects automatically with exponential back-off (max 60 s) on disconnect.
 
 ---
 
@@ -170,17 +236,39 @@ strategy = HybridStrategy(extra_rules=[my_rule])
 
 ---
 
+## Catalyst Suppression
+
+Suppress signals around known earnings, splits, or macro events:
+
+```python
+import pandas as pd
+from scalpedge.strategies import HybridStrategy
+
+strategy = HybridStrategy(
+    use_catalyst_filter=True,
+    catalyst_dates=[
+        pd.Timestamp("2024-01-25", tz="UTC"),   # TSLA Q4 earnings (whole day)
+        pd.Timestamp("2024-01-26 14:30", tz="UTC"),  # FOMC announcement (±30 min)
+    ],
+    catalyst_suppress_bars=6,   # ±6 bars = ±30 min at 5m
+)
+```
+
+Catalyst dates can also be fetched automatically via `PolygonClient.fetch_events()`.
+
+---
+
 ## Layers Explained
 
 | Layer | Module | What it does |
 |---|---|---|
-| Data | `data.py` | Fetches 5m OHLCV from Polygon.io (or yfinance fallback), stores in Parquet, auto-appends new bars |
-| TA | `ta_indicators.py` | EMA/SMA/RSI/MACD/BB/ATR/OBV/VWAP/Stoch/ADX + 60+ candle patterns |
+| Data | `data.py` | Fetches 5m OHLCV from Polygon.io Stocks Advanced (or yfinance fallback), stores in Parquet, auto-appends new bars; also exposes tick trades, NBBO quotes, snapshots, news, events, and WebSocket streaming |
+| TA | `ta_indicators.py` | EMA/SMA/RSI/MACD/BB/ATR/OBV/VWAP/Stoch/ADX + 60+ candle patterns; also computes bid-ask microstructure features (spread, imbalance) when quote data is available |
 | Probabilities | `probabilities.py` | Monte Carlo random walk + Markov chain order-2 transition probs |
 | Options | `options.py` | Black-Scholes call/put, delta, gamma, vega, theta, rho, implied vol |
-| ML | `ml.py` | RandomForest + PyTorch LSTM → combined P(up) score |
+| ML | `ml.py` | RandomForest + PyTorch LSTM → combined P(up) score; microstructure features (`spread_pct`, `bid_ask_imbalance`, `imbalance_ma_10`) included when available |
 | Backtester | `backtester.py` | Vectorized simulation, fee+slippage, equity curve, full metrics |
-| Strategies | `strategies.py` | TAStrategy (baseline) + HybridStrategy (all layers) |
+| Strategies | `strategies.py` | TAStrategy (baseline) + HybridStrategy (all layers + optional catalyst suppression filter) |
 
 ---
 

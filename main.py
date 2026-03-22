@@ -19,6 +19,11 @@ Usage
     uv run python main.py fetch SPY --output-dir /tmp/mydata
     uv run python main.py fetch SPY --years 10          # ~10 years of 5-min bars (chunked)
 
+    # Market scanner (requires POLYGON_API_KEY with Stocks Advanced):
+    uv run python main.py scan
+    uv run python main.py scan SPY TSLA AAPL NVDA QQQ
+    uv run python main.py scan --top 20                 # top 20 by absolute change %
+
 The ``data/`` directory is auto-created and grows on every run.
 """
 
@@ -143,6 +148,71 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     if errors:
         logger.warning("Failed tickers: %s", ", ".join(errors))
         sys.exit(1)
+
+
+def cmd_scan(args: argparse.Namespace) -> None:
+    """Print a pre-market or intraday scanner table using Polygon snapshots."""
+    import os
+
+    import pandas as pd
+
+    api_key = os.environ.get("POLYGON_API_KEY", "")
+    if not api_key:
+        print(
+            "❌  POLYGON_API_KEY is not set. "
+            "The scan command requires a Polygon Stocks Advanced subscription.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    from scalpedge.data import PolygonClient
+
+    client = PolygonClient(api_key=api_key)
+    tickers: list[str] | None = [t.upper() for t in args.tickers] if args.tickers else None
+    df = client.fetch_snapshot(tickers=tickers)
+
+    if df.empty:
+        print("No snapshot data returned.")
+        return
+
+    # Sort by absolute change % descending.
+    if "change_pct" in df.columns:
+        df = df.sort_values("change_pct", ascending=False, key=lambda s: s.abs())
+
+    top = getattr(args, "top", None)
+    if top:
+        df = df.head(int(top))
+
+    # Print table
+    col_w = {"ticker": 8, "last_trade_price": 12, "change_pct": 10, "day_volume": 14, "prev_close": 12}
+    header = (
+        f"{'TICKER':<{col_w['ticker']}}  "
+        f"{'LAST PRICE':>{col_w['last_trade_price']}}  "
+        f"{'CHANGE %':>{col_w['change_pct']}}  "
+        f"{'DAY VOLUME':>{col_w['day_volume']}}  "
+        f"{'PREV CLOSE':>{col_w['prev_close']}}"
+    )
+    print(header)
+    print("-" * len(header))
+    for _, row in df.iterrows():
+        ticker_str = str(row.get("ticker", ""))
+        price = row.get("last_trade_price")
+        chg = row.get("change_pct")
+        vol = row.get("day_volume")
+        prev = row.get("prev_close")
+
+        price_str = f"{price:.2f}" if pd.notna(price) else "  N/A"
+        chg_str = f"{chg:+.2f}%" if pd.notna(chg) else "   N/A"
+        vol_str = f"{int(vol):,}" if pd.notna(vol) else "          N/A"
+        prev_str = f"{prev:.2f}" if pd.notna(prev) else "  N/A"
+
+        print(
+            f"{ticker_str:<{col_w['ticker']}}  "
+            f"{price_str:>{col_w['last_trade_price']}}  "
+            f"{chg_str:>{col_w['change_pct']}}  "
+            f"{vol_str:>{col_w['day_volume']}}  "
+            f"{prev_str:>{col_w['prev_close']}}"
+        )
 
 
 def run_backtest(ticker: str) -> None:
@@ -318,10 +388,41 @@ def main() -> None:
         ),
     )
 
+    # ------------------------------------------------------------------ #
+    # scan sub-command                                                     #
+    # ------------------------------------------------------------------ #
+    scan_parser = subparsers.add_parser(
+        "scan",
+        help=(
+            "Print a pre-market or intraday scanner table using Polygon snapshots "
+            "(requires POLYGON_API_KEY with Stocks Advanced)."
+        ),
+    )
+    scan_parser.add_argument(
+        "tickers",
+        nargs="*",
+        metavar="TICKER",
+        help=(
+            "Tickers to scan. Fetches the whole market when omitted "
+            "(e.g. SPY TSLA AAPL NVDA QQQ)."
+        ),
+    )
+    scan_parser.add_argument(
+        "--top",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Limit output to the top N tickers by absolute change %% (e.g. --top 20).",
+    )
+
     args = parser.parse_args()
 
     if args.command == "fetch":
         cmd_fetch(args)
+        return
+
+    if args.command == "scan":
+        cmd_scan(args)
         return
 
     # Default / explicit backtest path.
