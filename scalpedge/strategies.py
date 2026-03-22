@@ -51,10 +51,19 @@ class BaseStrategy(ABC):
         ticker: str = "UNKNOWN",
         **bt_kwargs,
     ) -> BacktestResult:
-        """Generate signals and run the backtester. Returns :class:`BacktestResult`."""
+        """Generate signals and run the backtester. Returns :class:`BacktestResult`.
+
+        When ``atr_sl_mult`` and ``atr_tp_mult`` are passed in *bt_kwargs*,
+        the ``atr_14`` column from *df* is automatically used as the ATR
+        series unless an explicit ``atr`` kwarg is provided.
+        """
         signals = self.generate_signals(df)
+        # Pop `atr` from bt_kwargs so it is not forwarded to Backtester.__init__
+        atr = bt_kwargs.pop("atr", None)
+        if atr is None and bt_kwargs.get("atr_sl_mult") is not None and bt_kwargs.get("atr_tp_mult") is not None:
+            atr = df.get("atr_14")
         bt = Backtester(**bt_kwargs)
-        return bt.run(df, signals, ticker=ticker, strategy_name=self.name)
+        return bt.run(df, signals, ticker=ticker, strategy_name=self.name, atr=atr)
 
 
 # ---------------------------------------------------------------------------
