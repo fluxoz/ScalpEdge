@@ -883,3 +883,308 @@ class TestStrategies:
                                     fee_pct=0.005, slippage_pct=0.01, hold_bars=3)
         assert result.ticker == "TEST"
         assert result.strategy == "hybrid"
+
+
+# ---------------------------------------------------------------------------
+# PolygonClient — Stocks Advanced features
+# ---------------------------------------------------------------------------
+
+class TestPolygonClientAdvanced:
+    """Tests for the new Stocks Advanced methods on PolygonClient."""
+
+    def _make_client(self):
+        from scalpedge.data import PolygonClient
+
+        client = PolygonClient.__new__(PolygonClient)
+        client._api_key = "test"
+        client._last_call_time = 0.0
+        return client
+
+    def test_rate_limit_disabled(self):
+        """_rate_limit() should not sleep when _POLYGON_RATE_LIMIT_SECONDS == 0."""
+        import scalpedge.data as data_mod
+        from unittest.mock import patch
+
+        original = data_mod._POLYGON_RATE_LIMIT_SECONDS
+        try:
+            data_mod._POLYGON_RATE_LIMIT_SECONDS = 0.0
+            client = self._make_client()
+            with patch("scalpedge.data.time.sleep") as mock_sleep:
+                client._rate_limit()
+                mock_sleep.assert_not_called()
+        finally:
+            data_mod._POLYGON_RATE_LIMIT_SECONDS = original
+
+    def test_fetch_trades_basic(self):
+        """fetch_trades should return a DataFrame with expected columns and dtypes."""
+        from scalpedge.data import PolygonClient
+        from unittest.mock import MagicMock, patch
+
+        client = self._make_client()
+        ts_ns = pd.Timestamp("2024-01-02 10:00", tz="UTC").value
+        results = [
+            {"sip_timestamp": ts_ns, "price": 450.0, "size": 100, "exchange": 4,
+             "conditions": [14, 41]},
+            {"sip_timestamp": ts_ns + 1_000_000, "price": 450.5, "size": 200,
+             "exchange": 4, "conditions": [14]},
+        ]
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"status": "OK", "results": results}
+        mock_resp.raise_for_status.return_value = None
+
+        with patch("scalpedge.data.requests.get", return_value=mock_resp):
+            df = client.fetch_trades(
+                "SPY",
+                pd.Timestamp("2024-01-02", tz="UTC"),
+                pd.Timestamp("2024-01-03", tz="UTC"),
+            )
+
+        assert not df.empty
+        assert "datetime" in df.columns
+        assert "price" in df.columns
+        assert "size" in df.columns
+        assert df["datetime"].dt.tz is not None
+        assert len(df) == 2
+
+    def test_fetch_quotes_derived_columns(self):
+        """fetch_quotes should compute spread, mid_price, bid_ask_imbalance."""
+        from scalpedge.data import PolygonClient
+        from unittest.mock import MagicMock, patch
+
+        client = self._make_client()
+        ts_ns = pd.Timestamp("2024-01-02 10:00", tz="UTC").value
+        results = [
+            {
+                "sip_timestamp": ts_ns,
+                "bid_price": 449.0,
+                "bid_size": 300,
+                "ask_price": 451.0,
+                "ask_size": 100,
+            }
+        ]
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"status": "OK", "results": results}
+        mock_resp.raise_for_status.return_value = None
+
+        with patch("scalpedge.data.requests.get", return_value=mock_resp):
+            df = client.fetch_quotes(
+                "SPY",
+                pd.Timestamp("2024-01-02", tz="UTC"),
+                pd.Timestamp("2024-01-03", tz="UTC"),
+            )
+
+        assert not df.empty
+        assert "spread" in df.columns
+        assert "mid_price" in df.columns
+        assert "bid_ask_imbalance" in df.columns
+        assert abs(df["spread"].iloc[0] - 2.0) < 1e-9
+        assert abs(df["mid_price"].iloc[0] - 450.0) < 1e-9
+        # bid_size=300, ask_size=100 → positive imbalance
+        assert df["bid_ask_imbalance"].iloc[0] > 0
+
+    def test_fetch_snapshot_flattening(self):
+        """fetch_snapshot should flatten nested Polygon response into expected columns."""
+        from scalpedge.data import PolygonClient
+        from unittest.mock import MagicMock, patch
+
+        client = self._make_client()
+        raw_tickers = [
+            {
+                "ticker": "SPY",
+                "todaysChangePerc": 0.52,
+                "day": {"o": 449.0, "h": 452.0, "l": 448.0, "c": 451.0, "v": 5_000_000},
+                "prevDay": {"c": 448.67},
+                "lastTrade": {"p": 451.12, "s": 100},
+                "min": {"o": 450.9, "h": 451.2, "l": 450.7, "c": 451.0, "v": 12_000},
+            }
+        ]
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"status": "OK", "tickers": raw_tickers}
+        mock_resp.raise_for_status.return_value = None
+
+        with patch("scalpedge.data.requests.get", return_value=mock_resp):
+            df = client.fetch_snapshot(tickers=["SPY"])
+
+        expected_cols = {
+            "ticker", "day_open", "day_high", "day_low", "day_close", "day_volume",
+            "prev_close", "change_pct", "last_trade_price", "last_trade_size",
+            "min_open", "min_high", "min_low", "min_close", "min_volume",
+        }
+        assert expected_cols.issubset(set(df.columns))
+        assert df["ticker"].iloc[0] == "SPY"
+        assert df["change_pct"].iloc[0] == 0.52
+
+    def test_fetch_news_empty(self):
+        """fetch_news should return an empty DataFrame when there are no results."""
+        from scalpedge.data import PolygonClient
+        from unittest.mock import MagicMock, patch
+
+        client = self._make_client()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"status": "OK", "results": []}
+        mock_resp.raise_for_status.return_value = None
+
+        with patch("scalpedge.data.requests.get", return_value=mock_resp):
+            df = client.fetch_news("SPY")
+
+        assert df.empty
+        assert "title" in df.columns
+
+    def test_fetch_events_basic(self):
+        """fetch_events should parse date strings into pd.Timestamp objects."""
+        from scalpedge.data import PolygonClient
+        from unittest.mock import MagicMock, patch
+
+        client = self._make_client()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "status": "OK",
+            "results": {
+                "events": [
+                    {"type": "earnings", "date": "2024-01-25", "name": "Q4 2023 Earnings"},
+                    {"type": "split", "date": "2024-03-15", "name": "4:1 Stock Split"},
+                ]
+            },
+        }
+        mock_resp.raise_for_status.return_value = None
+
+        with patch("scalpedge.data.requests.get", return_value=mock_resp):
+            df = client.fetch_events("AAPL")
+
+        assert not df.empty
+        assert "event_type" in df.columns
+        assert "date" in df.columns
+        assert isinstance(df["date"].iloc[0], pd.Timestamp)
+        assert df["event_type"].iloc[0] == "earnings"
+
+
+# ---------------------------------------------------------------------------
+# Quote features (ta_indicators)
+# ---------------------------------------------------------------------------
+
+class TestQuoteFeatures:
+    def test_add_quote_features_present(self):
+        """add_quote_features should compute derived columns when input cols present."""
+        from scalpedge.ta_indicators import add_quote_features
+
+        df = pd.DataFrame(
+            {
+                "bid_price": [100.0, 100.5, 101.0],
+                "ask_price": [100.2, 100.7, 101.3],
+                "bid_size": [200.0, 300.0, 150.0],
+                "ask_size": [100.0, 100.0, 200.0],
+            }
+        )
+        result = add_quote_features(df)
+
+        assert "spread" in result.columns
+        assert "mid_price" in result.columns
+        assert "bid_ask_imbalance" in result.columns
+        assert "spread_pct" in result.columns
+        assert "imbalance_ma_10" in result.columns
+
+        # Spot-check first row: spread = 0.2, mid = 100.1
+        assert abs(result["spread"].iloc[0] - 0.2) < 1e-9
+        assert abs(result["mid_price"].iloc[0] - 100.1) < 1e-6
+        # bid_size=200 > ask_size=100 → positive imbalance
+        assert result["bid_ask_imbalance"].iloc[0] > 0
+
+    def test_add_quote_features_absent(self):
+        """add_quote_features should return the DataFrame unchanged if bid/ask absent."""
+        from scalpedge.ta_indicators import add_quote_features
+
+        df = pd.DataFrame({"close": [1.0, 2.0, 3.0], "volume": [100, 200, 300]})
+        result = add_quote_features(df)
+
+        assert list(result.columns) == list(df.columns)
+        assert len(result) == len(df)
+
+
+# ---------------------------------------------------------------------------
+# Catalyst suppression filter (strategies)
+# ---------------------------------------------------------------------------
+
+class TestCatalystFilter:
+    def _make_df(self, n: int = 50) -> pd.DataFrame:
+        """Small synthetic DataFrame with a datetime column."""
+        return pd.DataFrame(
+            {
+                "datetime": pd.date_range("2024-01-15 09:30", periods=n, freq="5min", tz="UTC"),
+                "close": 450.0 + np.arange(n) * 0.01,
+                "open": 449.0 + np.arange(n) * 0.01,
+                "high": 451.0 + np.arange(n) * 0.01,
+                "low": 448.0 + np.arange(n) * 0.01,
+                "volume": 100_000.0 * np.ones(n),
+                "ticker": "TEST",
+            }
+        )
+
+    def test_catalyst_suppression(self):
+        """Signals near a catalyst date should be zeroed out."""
+        from scalpedge.strategies import HybridStrategy
+
+        df = self._make_df(50)
+        # All signals are 1.
+        signal = pd.Series(1, index=df.index)
+
+        # Catalyst at the 25th bar's datetime.
+        catalyst_dt = df["datetime"].iloc[25]
+        strategy = HybridStrategy(
+            use_ml=False,
+            use_markov=False,
+            use_mc=False,
+            use_bs=False,
+            use_catalyst_filter=True,
+            catalyst_dates=[catalyst_dt],
+            catalyst_suppress_bars=3,
+        )
+        filtered = strategy._apply_catalyst_filter(signal, df)
+
+        # Bars 22–28 (±3 around bar 25) should be 0.
+        assert filtered.iloc[22] == 0
+        assert filtered.iloc[25] == 0
+        assert filtered.iloc[28] == 0
+        # Bars well outside the window should still be 1.
+        assert filtered.iloc[0] == 1
+        assert filtered.iloc[49] == 1
+
+    def test_catalyst_filter_disabled(self):
+        """Signals should be unchanged when use_catalyst_filter=False."""
+        from scalpedge.strategies import HybridStrategy
+
+        df = self._make_df(30)
+        signal = pd.Series(1, index=df.index)
+        catalyst_dt = df["datetime"].iloc[15]
+        strategy = HybridStrategy(
+            use_ml=False,
+            use_markov=False,
+            use_mc=False,
+            use_bs=False,
+            use_catalyst_filter=False,
+            catalyst_dates=[catalyst_dt],
+            catalyst_suppress_bars=3,
+        )
+        filtered = strategy._apply_catalyst_filter(signal, df)
+        # No suppression — all 1.
+        assert (filtered == 1).all()
+
+    def test_catalyst_date_only_suppresses_full_day(self):
+        """A date-only catalyst should suppress all bars on that calendar day."""
+        from scalpedge.strategies import HybridStrategy
+
+        df = self._make_df(50)
+        signal = pd.Series(1, index=df.index)
+        # Date-only catalyst: UTC midnight on 2024-01-15.
+        catalyst_date = pd.Timestamp("2024-01-15", tz="UTC")  # hour=0, min=0, sec=0
+        strategy = HybridStrategy(
+            use_ml=False,
+            use_markov=False,
+            use_mc=False,
+            use_bs=False,
+            use_catalyst_filter=True,
+            catalyst_dates=[catalyst_date],
+            catalyst_suppress_bars=3,
+        )
+        filtered = strategy._apply_catalyst_filter(signal, df)
+        # All bars are on 2024-01-15, so all should be 0.
+        assert (filtered == 0).all()

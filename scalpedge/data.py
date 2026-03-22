@@ -1,8 +1,8 @@
 """Data management module — fetch, store, and update 5-minute OHLCV data.
 
-Primary data source: **Polygon.io** (free tier).
+Primary data source: **Polygon.io** (Stocks Advanced plan).
   - Set the ``POLYGON_API_KEY`` environment variable to enable.
-  - Free tier: 5 API calls/minute, 2 years of historical minute aggregates.
+  - Stocks Advanced: unlimited API calls/minute, 5+ years of historical minute aggregates.
 
 Fallback data source: **yfinance** (used when ``POLYGON_API_KEY`` is not set).
   - Free; limited to ~60 days of 5-min history per request (chunked automatically).
@@ -13,11 +13,13 @@ dataset grows incrementally on every run.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
 import time
 from pathlib import Path
+from typing import Callable
 
 import pandas as pd
 import requests
@@ -75,13 +77,12 @@ _INTERVAL_STEP: dict[str, pd.Timedelta] = {
 # Polygon.io helpers
 # ---------------------------------------------------------------------------
 
-# Polygon free tier: 5 calls/minute.  We pace at 13 s/call (~4.6 calls/min)
-# rather than the theoretical minimum of 12 s/call (exactly 5 calls/min) to
-# provide a small safety margin against clock jitter and network latency.
-_POLYGON_RATE_LIMIT_SECONDS = 13.0
+# Stocks Advanced plan: unlimited API calls.  Rate limiting is disabled.
+# Set to a positive float to re-enable pacing if needed (seconds per call).
+_POLYGON_RATE_LIMIT_SECONDS = 0.0
 
-# Polygon free tier: 2 years of minute-aggregate history.
-_POLYGON_MAX_HISTORY_DAYS = 730
+# Stocks Advanced plan provides at least 5 years of minute-aggregate history.
+_POLYGON_MAX_HISTORY_DAYS = 1825
 
 # Maximum bars returned per Polygon API page (their documented hard limit).
 _POLYGON_MAX_LIMIT = 50_000
@@ -109,7 +110,7 @@ _INTERVAL_TO_POLYGON: dict[str, tuple[int, str]] = {
 
 
 class PolygonClient:
-    """Thin wrapper around the Polygon.io v2 aggregates REST endpoint.
+    """Thin wrapper around the Polygon.io REST API (Stocks Advanced plan).
 
     Parameters
     ----------
@@ -119,12 +120,15 @@ class PolygonClient:
 
     Notes
     -----
-    Free-tier limits observed by this client:
+    Stocks Advanced plan features used by this client:
 
-    * **5 calls / minute** — enforced via a configurable sleep between
-      successive requests.
-    * **2 years of history** — a warning is logged (but not an error) if the
-      requested range extends beyond 2 years ago.
+    * **Unlimited API calls** — rate limiting is disabled by default.
+    * **5+ years of minute-bar history** — via the v2 aggregates endpoint.
+    * **Tick-level trade data** — via ``/v3/trades/{ticker}``.
+    * **NBBO quote data** — via ``/v3/quotes/{ticker}``.
+    * **Market snapshots** — via ``/v2/snapshot/locale/us/markets/stocks/tickers``.
+    * **News articles** — via ``/v2/reference/news``.
+    * **Corporate events** — via ``/vX/reference/tickers/{ticker}/events``.
     """
 
     BASE_URL = "https://api.polygon.io"
@@ -180,11 +184,11 @@ class PolygonClient:
         cutoff = now_utc - pd.Timedelta(days=_POLYGON_MAX_HISTORY_DAYS)
         if start < cutoff:
             logger.warning(
-                "Polygon free tier only provides %d days of history. "
-                "Requested start %s is before the cutoff %s; data may be incomplete.",
-                _POLYGON_MAX_HISTORY_DAYS,
+                "Requested start %s is before the Stocks Advanced plan cutoff %s "
+                "(%d days); data may be incomplete.",
                 start.strftime("%Y-%m-%d"),
                 cutoff.strftime("%Y-%m-%d"),
+                _POLYGON_MAX_HISTORY_DAYS,
             )
 
         from_str = start.strftime("%Y-%m-%d")
@@ -241,12 +245,393 @@ class PolygonClient:
 
         return self._results_to_df(all_results, ticker)
 
+    def fetch_trades(
+        self,
+        ticker: str,
+        start: pd.Timestamp,
+        end: pd.Timestamp,
+        limit: int = 50_000,
+    ) -> pd.DataFrame:
+        """Fetch individual trade ticks from Polygon /v3/trades/{ticker}.
+
+        Returns a DataFrame with columns:
+            datetime (UTC, tz-aware), price, size, exchange, conditions, ticker
+        Follows pagination via next_url. Requires Stocks Advanced.
+
+        Parameters
+        ----------
+        ticker:
+            Ticker symbol (e.g. ``"SPY"``).
+        start:
+            Inclusive UTC start timestamp.
+        end:
+            Inclusive UTC end timestamp.
+        limit:
+            Maximum results per page (Polygon max: 50 000).
+        """
+        start_ns = int(start.value)  # pd.Timestamp.value is nanoseconds
+        end_ns = int(end.value)
+
+        url: str | None = (
+            f"{self.BASE_URL}/v3/trades/{ticker}"
+        )
+        params: dict[str, object] = {
+            "timestamp.gte": start_ns,
+            "timestamp.lte": end_ns,
+            "limit": limit,
+            "apiKey": self._api_key,
+        }
+
+        all_results: list[dict] = []
+        page = 0
+        while url:
+            page += 1
+            self._rate_limit()
+            logger.debug("Polygon trades: GET %s (page %d)", url, page)
+            try:
+                resp = requests.get(url, params=params, timeout=30)
+                resp.raise_for_status()
+            except requests.RequestException as exc:
+                logger.warning("Polygon trades request failed for %s: %s", ticker, exc)
+                break
+
+            body = resp.json()
+            status = body.get("status", "")
+            if status not in ("OK", "DELAYED"):
+                logger.warning(
+                    "Polygon trades returned status=%r for %s: %s",
+                    status,
+                    ticker,
+                    body.get("message", ""),
+                )
+                break
+
+            results = body.get("results") or []
+            all_results.extend(results)
+
+            url = body.get("next_url")
+            params = {"apiKey": self._api_key} if url else {}
+
+        if not all_results:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(all_results)
+        # Use sip_timestamp (nanoseconds) if available, else participant_timestamp
+        ts_col = "sip_timestamp" if "sip_timestamp" in df.columns else "participant_timestamp"
+        if ts_col not in df.columns:
+            logger.warning("No timestamp column found in trade data for %s", ticker)
+            return pd.DataFrame()
+
+        df["datetime"] = pd.to_datetime(df[ts_col], unit="ns", utc=True)
+        keep = ["datetime"]
+        for src, dst in [
+            ("price", "price"),
+            ("size", "size"),
+            ("exchange", "exchange"),
+            ("conditions", "conditions"),
+        ]:
+            if src in df.columns:
+                df[dst] = df[src]
+                keep.append(dst)
+
+        df = df[keep].copy()
+        df["ticker"] = ticker
+        df = df.dropna(subset=[c for c in ["price", "size"] if c in df.columns])
+        return df.sort_values("datetime").reset_index(drop=True)
+
+    def fetch_quotes(
+        self,
+        ticker: str,
+        start: pd.Timestamp,
+        end: pd.Timestamp,
+        limit: int = 50_000,
+    ) -> pd.DataFrame:
+        """Fetch NBBO quote ticks from Polygon /v3/quotes/{ticker}.
+
+        Returns a DataFrame with columns:
+            datetime (UTC, tz-aware), bid_price, bid_size, ask_price, ask_size,
+            spread, mid_price, bid_ask_imbalance, ticker
+        Follows pagination. Requires Stocks Advanced.
+
+        Parameters
+        ----------
+        ticker:
+            Ticker symbol (e.g. ``"SPY"``).
+        start:
+            Inclusive UTC start timestamp.
+        end:
+            Inclusive UTC end timestamp.
+        limit:
+            Maximum results per page (Polygon max: 50 000).
+        """
+        start_ns = int(start.value)
+        end_ns = int(end.value)
+
+        url: str | None = f"{self.BASE_URL}/v3/quotes/{ticker}"
+        params: dict[str, object] = {
+            "timestamp.gte": start_ns,
+            "timestamp.lte": end_ns,
+            "limit": limit,
+            "apiKey": self._api_key,
+        }
+
+        all_results: list[dict] = []
+        page = 0
+        while url:
+            page += 1
+            self._rate_limit()
+            logger.debug("Polygon quotes: GET %s (page %d)", url, page)
+            try:
+                resp = requests.get(url, params=params, timeout=30)
+                resp.raise_for_status()
+            except requests.RequestException as exc:
+                logger.warning("Polygon quotes request failed for %s: %s", ticker, exc)
+                break
+
+            body = resp.json()
+            status = body.get("status", "")
+            if status not in ("OK", "DELAYED"):
+                logger.warning(
+                    "Polygon quotes returned status=%r for %s: %s",
+                    status,
+                    ticker,
+                    body.get("message", ""),
+                )
+                break
+
+            results = body.get("results") or []
+            all_results.extend(results)
+
+            url = body.get("next_url")
+            params = {"apiKey": self._api_key} if url else {}
+
+        if not all_results:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(all_results)
+        if "sip_timestamp" not in df.columns:
+            logger.warning("No sip_timestamp column found in quote data for %s", ticker)
+            return pd.DataFrame()
+
+        df["datetime"] = pd.to_datetime(df["sip_timestamp"], unit="ns", utc=True)
+
+        for col in ("bid_price", "bid_size", "ask_price", "ask_size"):
+            if col not in df.columns:
+                df[col] = float("nan")
+
+        df = df[["datetime", "bid_price", "bid_size", "ask_price", "ask_size"]].copy()
+        df = df.dropna(subset=["bid_price", "ask_price"])
+
+        bid = df["bid_price"].astype(float)
+        ask = df["ask_price"].astype(float)
+        bid_sz = df["bid_size"].astype(float)
+        ask_sz = df["ask_size"].astype(float)
+
+        df["spread"] = ask - bid
+        df["mid_price"] = (bid + ask) / 2
+        df["bid_ask_imbalance"] = (bid_sz - ask_sz) / (bid_sz + ask_sz + 1e-9)
+        df["ticker"] = ticker
+
+        return df.sort_values("datetime").reset_index(drop=True)
+
+    def fetch_snapshot(
+        self,
+        tickers: list[str] | None = None,
+    ) -> pd.DataFrame:
+        """Fetch market snapshot(s) from Polygon.
+
+        Endpoint: ``/v2/snapshot/locale/us/markets/stocks/tickers``
+
+        If *tickers* is ``None`` or empty, fetches the whole market.
+
+        Returns a DataFrame with columns:
+            ticker, day_open, day_high, day_low, day_close, day_volume,
+            prev_close, change_pct, last_trade_price, last_trade_size,
+            min_open, min_high, min_low, min_close, min_volume
+
+        Parameters
+        ----------
+        tickers:
+            Optional list of ticker symbols to fetch (e.g. ``["AAPL", "TSLA"]``).
+            Pass ``None`` or an empty list to fetch the whole market.
+        """
+        url = f"{self.BASE_URL}/v2/snapshot/locale/us/markets/stocks/tickers"
+        params: dict[str, object] = {"apiKey": self._api_key}
+        if tickers:
+            params["tickers"] = ",".join(t.upper() for t in tickers)
+
+        self._rate_limit()
+        logger.debug("Polygon snapshot: GET %s", url)
+        try:
+            resp = requests.get(url, params=params, timeout=30)
+            resp.raise_for_status()
+        except requests.RequestException as exc:
+            logger.warning("Polygon snapshot request failed: %s", exc)
+            return pd.DataFrame()
+
+        body = resp.json()
+        status = body.get("status", "")
+        if status not in ("OK", "DELAYED"):
+            logger.warning(
+                "Polygon snapshot returned status=%r: %s",
+                status,
+                body.get("message", ""),
+            )
+            return pd.DataFrame()
+
+        raw = body.get("tickers") or []
+        if not raw:
+            return pd.DataFrame()
+
+        rows = []
+        for item in raw:
+            day = item.get("day") or {}
+            prev_day = item.get("prevDay") or {}
+            last_trade = item.get("lastTrade") or {}
+            minute = item.get("min") or {}
+            rows.append(
+                {
+                    "ticker": item.get("ticker", ""),
+                    "day_open": day.get("o"),
+                    "day_high": day.get("h"),
+                    "day_low": day.get("l"),
+                    "day_close": day.get("c"),
+                    "day_volume": day.get("v"),
+                    "prev_close": prev_day.get("c"),
+                    "change_pct": item.get("todaysChangePerc"),
+                    "last_trade_price": last_trade.get("p"),
+                    "last_trade_size": last_trade.get("s"),
+                    "min_open": minute.get("o"),
+                    "min_high": minute.get("h"),
+                    "min_low": minute.get("l"),
+                    "min_close": minute.get("c"),
+                    "min_volume": minute.get("v"),
+                }
+            )
+
+        return pd.DataFrame(rows)
+
+    def fetch_news(
+        self,
+        ticker: str,
+        limit: int = 50,
+        published_utc_gte: str | None = None,
+    ) -> pd.DataFrame:
+        """Fetch news articles for *ticker* from Polygon /v2/reference/news.
+
+        Returns a DataFrame with columns:
+            published_utc, title, description, article_url, tickers, keywords
+
+        Parameters
+        ----------
+        ticker:
+            Ticker symbol (e.g. ``"SPY"``).
+        limit:
+            Maximum number of articles to return (default: 50).
+        published_utc_gte:
+            Optional ISO-8601 date string to filter articles published on or
+            after this date (e.g. ``"2024-01-01"``).
+        """
+        url = f"{self.BASE_URL}/v2/reference/news"
+        params: dict[str, object] = {
+            "ticker": ticker.upper(),
+            "limit": limit,
+            "order": "desc",
+            "apiKey": self._api_key,
+        }
+        if published_utc_gte is not None:
+            params["published_utc.gte"] = published_utc_gte
+
+        self._rate_limit()
+        logger.debug("Polygon news: GET %s", url)
+        try:
+            resp = requests.get(url, params=params, timeout=30)
+            resp.raise_for_status()
+        except requests.RequestException as exc:
+            logger.warning("Polygon news request failed for %s: %s", ticker, exc)
+            return pd.DataFrame()
+
+        body = resp.json()
+        results = body.get("results") or []
+        if not results:
+            return pd.DataFrame(
+                columns=["published_utc", "title", "description", "article_url", "tickers", "keywords"]
+            )
+
+        rows = []
+        for item in results:
+            rows.append(
+                {
+                    "published_utc": item.get("published_utc"),
+                    "title": item.get("title"),
+                    "description": item.get("description"),
+                    "article_url": item.get("article_url"),
+                    "tickers": item.get("tickers"),
+                    "keywords": item.get("keywords"),
+                }
+            )
+        return pd.DataFrame(rows)
+
+    def fetch_events(
+        self,
+        ticker: str,
+    ) -> pd.DataFrame:
+        """Fetch corporate events (earnings, splits, dividends) for *ticker*.
+
+        Endpoint: ``/vX/reference/tickers/{ticker}/events``
+
+        Returns a DataFrame with columns:
+            event_type, date, name, description
+        where ``date`` is a ``pd.Timestamp`` (UTC midnight for date-only strings).
+
+        Parameters
+        ----------
+        ticker:
+            Ticker symbol (e.g. ``"AAPL"``).
+        """
+        url = f"{self.BASE_URL}/vX/reference/tickers/{ticker.upper()}/events"
+        params: dict[str, object] = {"apiKey": self._api_key}
+
+        self._rate_limit()
+        logger.debug("Polygon events: GET %s", url)
+        try:
+            resp = requests.get(url, params=params, timeout=30)
+            resp.raise_for_status()
+        except requests.RequestException as exc:
+            logger.warning("Polygon events request failed for %s: %s", ticker, exc)
+            return pd.DataFrame(columns=["event_type", "date", "name", "description"])
+
+        body = resp.json()
+        results = body.get("results") or {}
+        events = results.get("events") if isinstance(results, dict) else None
+        if not events:
+            return pd.DataFrame(columns=["event_type", "date", "name", "description"])
+
+        rows = []
+        for event in events:
+            date_raw = event.get("date")
+            try:
+                date_ts = pd.Timestamp(date_raw, tz="UTC") if date_raw else pd.NaT
+            except Exception:
+                date_ts = pd.NaT
+            rows.append(
+                {
+                    "event_type": event.get("type", ""),
+                    "date": date_ts,
+                    "name": event.get("name", ""),
+                    "description": event.get("description", ""),
+                }
+            )
+        return pd.DataFrame(rows)
+
     # ------------------------------------------------------------------
     # Private
     # ------------------------------------------------------------------
 
     def _rate_limit(self) -> None:
-        """Sleep if necessary to stay within the 5-calls/minute limit."""
+        """Pace API calls if ``_POLYGON_RATE_LIMIT_SECONDS`` > 0; otherwise a no-op."""
+        if _POLYGON_RATE_LIMIT_SECONDS <= 0:
+            return
         elapsed = time.monotonic() - self._last_call_time
         if elapsed < _POLYGON_RATE_LIMIT_SECONDS:
             time.sleep(_POLYGON_RATE_LIMIT_SECONDS - elapsed)
@@ -269,6 +654,182 @@ class PolygonClient:
         return df.sort_values("datetime").reset_index(drop=True)
 
 
+class PolygonStream:
+    """Real-time WebSocket stream from Polygon.io (Stocks Advanced).
+
+    Subscribes to aggregate bars (AM.*), per-second bars (A.*), and/or
+    trade ticks (T.*) for a list of tickers and calls a user-supplied
+    callback on each message.
+
+    Parameters
+    ----------
+    tickers:
+        List of ticker symbols to subscribe to (e.g. ["SPY", "TSLA"]).
+    on_bar:
+        Async callable(bar: dict) invoked for every aggregate bar message.
+    on_trade:
+        Optional async callable(trade: dict) invoked for every trade tick.
+    api_key:
+        Polygon API key. Falls back to POLYGON_API_KEY env var.
+    feed:
+        WebSocket feed URL. Defaults to ``wss://socket.polygon.io/stocks``.
+    subscriptions:
+        List of channel prefixes to subscribe. Defaults to ``["AM.*"]``
+        (per-minute bars). Other options: ``"A.*"`` (per-second),
+        ``"T.*"`` (trades), ``"Q.*"`` (quotes).
+
+    Usage
+    -----
+        async def handle_bar(bar):
+            print(bar)
+
+        stream = PolygonStream(["SPY", "TSLA"], on_bar=handle_bar)
+        asyncio.run(stream.run())
+
+    Notes
+    -----
+    Requires the ``websockets`` package (install with
+    ``pip install scalpedge[streaming]``).  The import is deferred to
+    :meth:`run` so the rest of the module works without it.
+
+    Reconnects automatically on disconnect with exponential back-off
+    (max 60 s).
+    """
+
+    WS_URL = "wss://socket.polygon.io/stocks"
+
+    def __init__(
+        self,
+        tickers: list[str],
+        on_bar: Callable | None = None,
+        on_trade: Callable | None = None,
+        api_key: str | None = None,
+        feed: str | None = None,
+        subscriptions: list[str] | None = None,
+    ) -> None:
+        self._tickers = [t.upper() for t in tickers]
+        self._on_bar = on_bar
+        self._on_trade = on_trade
+        self._api_key = api_key or os.environ.get("POLYGON_API_KEY", "")
+        if not self._api_key:
+            raise ValueError(
+                "Polygon API key not found.  Set the POLYGON_API_KEY "
+                "environment variable or pass api_key= explicitly."
+            )
+        self._feed = feed or self.WS_URL
+        self._subscriptions = subscriptions or ["AM.*"]
+
+    async def run(self) -> None:
+        """Connect, authenticate, subscribe, and stream until cancelled."""
+        try:
+            import websockets  # type: ignore[import]
+        except ImportError as exc:
+            raise ImportError(
+                "The 'websockets' package is required for PolygonStream. "
+                "Install it with: pip install 'scalpedge[streaming]'"
+            ) from exc
+
+        attempt = 0
+        while True:
+            try:
+                await self._connect_and_stream(websockets)
+                attempt = 0  # reset on clean disconnect
+            except Exception as exc:
+                delay = min(2**attempt, 60)
+                logger.warning(
+                    "PolygonStream disconnected (%s). Reconnecting in %ds …", exc, delay
+                )
+                attempt += 1
+                import asyncio
+                await asyncio.sleep(delay)
+
+    async def _connect_and_stream(self, websockets) -> None:  # type: ignore[no-untyped-def]
+        """Single connection attempt: auth → subscribe → receive loop."""
+        import asyncio
+
+        async with websockets.connect(self._feed) as ws:
+            # Wait for connected status
+            raw = await ws.recv()
+            msgs = json.loads(raw)
+            if not any(m.get("status") == "connected" for m in msgs):
+                raise RuntimeError(f"Unexpected connect message: {msgs}")
+
+            # Authenticate
+            await ws.send(json.dumps({"action": "auth", "params": self._api_key}))
+            raw = await ws.recv()
+            msgs = json.loads(raw)
+            if not any(m.get("status") == "auth_success" for m in msgs):
+                raise RuntimeError(f"Authentication failed: {msgs}")
+
+            logger.info("PolygonStream: authenticated, subscribing …")
+
+            # Subscribe
+            subscribe_msg = self._build_subscribe_message()
+            await ws.send(subscribe_msg)
+
+            attempt_reset_logged = False
+            async for raw_msg in ws:
+                if not attempt_reset_logged:
+                    logger.info("PolygonStream: receiving messages …")
+                    attempt_reset_logged = True
+                messages = json.loads(raw_msg)
+                for msg in messages:
+                    ev = msg.get("ev", "")
+                    if ev in ("AM", "A"):
+                        if self._on_bar is not None:
+                            bar = self._normalise_bar(msg)
+                            coro = self._on_bar(bar)
+                            if asyncio.iscoroutine(coro):
+                                await coro
+                    elif ev == "T":
+                        if self._on_trade is not None:
+                            trade = self._normalise_trade(msg)
+                            coro = self._on_trade(trade)
+                            if asyncio.iscoroutine(coro):
+                                await coro
+
+    def _build_subscribe_message(self) -> str:
+        """Build the JSON subscribe payload for the chosen channels and tickers."""
+        channels: list[str] = []
+        for sub in self._subscriptions:
+            prefix = sub.rstrip(".*").rstrip(".")
+            if sub.endswith("*"):
+                for t in self._tickers:
+                    channels.append(f"{prefix}.{t}")
+            else:
+                channels.append(sub)
+        params = ",".join(channels)
+        return json.dumps({"action": "subscribe", "params": params})
+
+    @staticmethod
+    def _normalise_bar(msg: dict) -> dict:
+        """Normalise an AM/A bar message to a standard dict."""
+        ts_ms = msg.get("s") or msg.get("e", 0)
+        return {
+            "ticker": msg.get("sym", ""),
+            "open": msg.get("o"),
+            "high": msg.get("h"),
+            "low": msg.get("l"),
+            "close": msg.get("c"),
+            "volume": msg.get("v"),
+            "datetime": pd.Timestamp(ts_ms, unit="ms", tz="UTC"),
+            "ev": msg.get("ev"),
+        }
+
+    @staticmethod
+    def _normalise_trade(msg: dict) -> dict:
+        """Normalise a T (trade) message to a standard dict."""
+        ts_ms = msg.get("t", 0)
+        return {
+            "ticker": msg.get("sym", ""),
+            "price": msg.get("p"),
+            "size": msg.get("s"),
+            "exchange": msg.get("x"),
+            "conditions": msg.get("c"),
+            "datetime": pd.Timestamp(ts_ms, unit="ms", tz="UTC"),
+        }
+
+
 class DataManager:
     """Fetch and persist OHLCV bars for one or many tickers.
 
@@ -279,7 +840,8 @@ class DataManager:
     Data source selection
     ---------------------
     * **Polygon.io** (primary) — used when the ``POLYGON_API_KEY`` environment
-      variable is set.  Free tier: 5 calls/min, 2 years of minute aggregates.
+      variable is set.  Stocks Advanced plan: unlimited calls, 5+ years of
+      minute aggregates.
     * **yfinance** (fallback) — used when ``POLYGON_API_KEY`` is absent.
       Free; limited to ~60 days of 5-min history per request (chunked
       automatically for longer ranges).
@@ -446,7 +1008,7 @@ class DataManager:
             fetch_start = pd.Timestamp(start, tz="UTC")
         elif existing.empty:
             if self._polygon is not None:
-                # For Polygon, default to the full 2-year free-tier window.
+                # For Polygon, default to the full Stocks Advanced plan window.
                 fetch_start = now_utc - pd.Timedelta(days=_POLYGON_MAX_HISTORY_DAYS)
             else:
                 max_days = _INTERVAL_MAX_DAYS.get(self.interval, _MAX_DAYS_PER_FETCH)
