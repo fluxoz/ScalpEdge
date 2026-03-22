@@ -833,10 +833,112 @@ class TestBacktester:
             assert result.profit_factor >= 0
             assert result.max_drawdown_pct <= 0
 
+    def test_atr_exits_basic(self, clean_df):
+        """ATR-based exits should fire and populate exit_type in trade log."""
+        from scalpedge.backtester import Backtester
 
-# ---------------------------------------------------------------------------
-# Strategies
-# ---------------------------------------------------------------------------
+        bt = Backtester(hold_bars=6, atr_sl_mult=1.0, atr_tp_mult=1.5)
+        signal = pd.Series([1 if i % 8 == 0 else 0 for i in range(len(clean_df))], index=clean_df.index)
+        # Use a small constant ATR so stops/targets are well-defined
+        atr = pd.Series(clean_df["close"].mean() * 0.005, index=clean_df.index)
+        result = bt.run(clean_df, signal, ticker="TEST", atr=atr)
+        if result.n_trades > 0:
+            assert "exit_type" in result.trade_log.columns
+            assert result.trade_log["exit_type"].isin(["tp", "sl", "time"]).all()
+            # Exit rates should sum to ~1
+            total = result.atr_tp_rate + result.atr_sl_rate + result.atr_time_exit_rate
+            assert abs(total - 1.0) < 1e-9
+
+    def test_atr_exits_sl_triggered(self):
+        """A trade where price drops sharply should hit the stop loss."""
+        from scalpedge.backtester import Backtester
+
+        # Build a synthetic price series: entry at 100, then drops significantly
+        prices = [100.0] * 3 + [90.0] * 10
+        n = len(prices)
+        df = pd.DataFrame({
+            "open": prices,
+            "high": [p * 1.001 for p in prices],
+            "low": [p * 0.999 for p in prices],
+            "close": prices,
+        })
+        # Override low on bar 2 (i+1=2 relative to entry) to go well below SL
+        df.loc[2, "low"] = 95.0  # below 100 - 1.5 * 1.0 = 98.5
+
+        atr = pd.Series(1.0, index=df.index)
+        bt = Backtester(hold_bars=8, atr_sl_mult=1.5, atr_tp_mult=3.0, fee_pct=0.0, slippage_pct=0.0)
+        signal = pd.Series([1] + [0] * (n - 1), index=df.index)
+        result = bt.run(df, signal, atr=atr)
+        assert result.n_trades == 1
+        assert result.trade_log.iloc[0]["exit_type"] == "sl"
+        assert result.atr_sl_rate == 1.0
+
+    def test_atr_exits_tp_triggered(self):
+        """A trade where price rises sharply should hit the take profit."""
+        from scalpedge.backtester import Backtester
+
+        prices = [100.0] * 10
+        n = len(prices)
+        df = pd.DataFrame({
+            "open": prices,
+            "high": [p * 1.001 for p in prices],
+            "low": [p * 0.999 for p in prices],
+            "close": prices,
+        })
+        # Override high on bar 2 to go well above TP (100 + 2.0 * 1.0 = 102)
+        df.loc[2, "high"] = 103.0
+
+        atr = pd.Series(1.0, index=df.index)
+        bt = Backtester(hold_bars=8, atr_sl_mult=1.5, atr_tp_mult=2.0, fee_pct=0.0, slippage_pct=0.0)
+        signal = pd.Series([1] + [0] * (n - 1), index=df.index)
+        result = bt.run(df, signal, atr=atr)
+        assert result.n_trades == 1
+        assert result.trade_log.iloc[0]["exit_type"] == "tp"
+        assert result.atr_tp_rate == 1.0
+
+    def test_atr_exits_fallback_without_atr(self, clean_df):
+        """When atr_sl_mult/atr_tp_mult are set but atr=None, falls back to hold_bars."""
+        from scalpedge.backtester import Backtester
+
+        bt = Backtester(hold_bars=3, atr_sl_mult=1.5, atr_tp_mult=2.0)
+        signal = pd.Series([1 if i % 5 == 0 else 0 for i in range(len(clean_df))], index=clean_df.index)
+        result = bt.run(clean_df, signal, ticker="TEST")
+        if result.n_trades > 0:
+            # All exits should be time exits (fallback to hold_bars)
+            assert (result.trade_log["exit_type"] == "time").all()
+
+    def test_atr_exits_summary_shows_breakdown(self, clean_df):
+        """BacktestResult.summary() should include ATR breakdown when relevant."""
+        from scalpedge.backtester import Backtester, BacktestResult
+
+        bt = Backtester(hold_bars=6, atr_sl_mult=1.0, atr_tp_mult=1.5)
+        signal = pd.Series([1 if i % 8 == 0 else 0 for i in range(len(clean_df))], index=clean_df.index)
+        atr = pd.Series(clean_df["close"].mean() * 0.005, index=clean_df.index)
+        result = bt.run(clean_df, signal, atr=atr)
+        summary = result.summary()
+        if result.atr_tp_rate + result.atr_sl_rate > 0:
+            assert "ATR Exit Breakdown" in summary
+            assert "TP Exits" in summary
+            assert "SL Exits" in summary
+
+    def test_strategy_atr_exits_via_backtest(self, clean_df):
+        """TAStrategy.backtest() should auto-use atr_14 from df for ATR exits."""
+        from scalpedge.strategies import TAStrategy
+        from scalpedge.ta_indicators import add_all_indicators
+
+        df_with_indicators = add_all_indicators(clean_df.copy())
+        result = TAStrategy().backtest(
+            df_with_indicators,
+            ticker="TEST",
+            hold_bars=6,
+            atr_sl_mult=1.5,
+            atr_tp_mult=2.0,
+        )
+        assert result.ticker == "TEST"
+        if result.n_trades > 0:
+            assert "exit_type" in result.trade_log.columns
+            total = result.atr_tp_rate + result.atr_sl_rate + result.atr_time_exit_rate
+            assert abs(total - 1.0) < 1e-9
 
 class TestStrategies:
     def test_ta_strategy_signals(self, clean_df):
