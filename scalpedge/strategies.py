@@ -130,6 +130,16 @@ class HybridStrategy(BaseStrategy):
         Whether to use the Monte Carlo layer.
     use_bs:
         Whether to use the Black-Scholes delta filter.
+    use_catalyst_filter:
+        When ``True`` and *catalyst_dates* is non-empty, suppress all entry
+        signals within ±*catalyst_suppress_bars* bars of any catalyst date.
+    catalyst_dates:
+        List of ``pd.Timestamp`` objects (date or datetime) marking known
+        catalyst events (earnings, splits, macro releases, etc.).  For
+        date-only catalysts every bar on that calendar day is suppressed.
+    catalyst_suppress_bars:
+        Half-window of bars to suppress around each catalyst (default 6,
+        i.e. ±30 min at 5-minute bars).
     """
 
     name = "hybrid"
@@ -150,6 +160,9 @@ class HybridStrategy(BaseStrategy):
         use_markov: bool = True,
         use_mc: bool = True,
         use_bs: bool = True,
+        use_catalyst_filter: bool = False,
+        catalyst_dates: list[pd.Timestamp] | None = None,
+        catalyst_suppress_bars: int = 6,
     ) -> None:
         self.markov_order = markov_order
         self.mc_n_simulations = mc_n_simulations
@@ -165,6 +178,9 @@ class HybridStrategy(BaseStrategy):
         self.use_markov = use_markov
         self.use_mc = use_mc
         self.use_bs = use_bs
+        self.use_catalyst_filter = use_catalyst_filter
+        self.catalyst_dates = catalyst_dates or []
+        self.catalyst_suppress_bars = catalyst_suppress_bars
 
         self._markov = MarkovChain(order=markov_order)
         self._mc = MonteCarlo(n_simulations=mc_n_simulations)
@@ -245,6 +261,11 @@ class HybridStrategy(BaseStrategy):
         for rule_fn in self.extra_rules:
             combined = combined & rule_fn(df).astype(bool)
 
+        # ----------------------------------------------------------------
+        # Catalyst suppression filter (final gate)
+        # ----------------------------------------------------------------
+        combined = self._apply_catalyst_filter(combined.astype(int), df).astype(bool)
+
         return combined.astype(int)
 
     # ------------------------------------------------------------------
@@ -300,3 +321,56 @@ class HybridStrategy(BaseStrategy):
 
         passes = atm_delta >= self.bs_min_delta
         return pd.Series(passes, index=close.index)
+
+    def _apply_catalyst_filter(
+        self,
+        signal: pd.Series,
+        df: pd.DataFrame,
+    ) -> pd.Series:
+        """Zero out signals within ±catalyst_suppress_bars of known catalysts.
+
+        Returns *signal* unchanged when ``use_catalyst_filter`` is ``False``
+        or when no catalyst dates are configured.
+
+        For date-only catalysts every bar on that calendar day is suppressed.
+        For datetime catalysts the suppression window is
+        ±*catalyst_suppress_bars* bars around the catalyst timestamp.
+
+        Parameters
+        ----------
+        signal:
+            Integer (0/1) signal Series aligned with *df*.
+        df:
+            OHLCV + indicators DataFrame; must contain a ``datetime`` column.
+
+        Returns
+        -------
+        pd.Series
+            Signal with catalyst-affected bars zeroed out.
+        """
+        if not self.use_catalyst_filter or not self.catalyst_dates:
+            return signal
+
+        signal = signal.copy()
+        if "datetime" not in df.columns:
+            return signal
+
+        dt = pd.to_datetime(df["datetime"])
+        suppress_bars = self.catalyst_suppress_bars
+
+        for cat in self.catalyst_dates:
+            cat_ts = pd.Timestamp(cat)
+            if cat_ts.hour == 0 and cat_ts.minute == 0 and cat_ts.second == 0:
+                # Date-only catalyst — suppress entire trading day.
+                mask = dt.dt.date == cat_ts.date()
+                signal[mask] = 0
+            else:
+                # Datetime catalyst — suppress ±suppress_bars around the index.
+                diffs = (dt - cat_ts).abs()
+                closest_idx = diffs.idxmin()
+                pos = signal.index.get_loc(closest_idx)
+                lo = max(0, pos - suppress_bars)
+                hi = min(len(signal) - 1, pos + suppress_bars)
+                signal.iloc[lo : hi + 1] = 0
+
+        return signal
