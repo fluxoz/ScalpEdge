@@ -154,6 +154,8 @@ def cmd_scan(args: argparse.Namespace) -> None:
     """Print a pre-market or intraday scanner table using Polygon snapshots."""
     import os
 
+    import pandas as pd
+
     api_key = os.environ.get("POLYGON_API_KEY", "")
     if not api_key:
         print(
@@ -199,10 +201,10 @@ def cmd_scan(args: argparse.Namespace) -> None:
         vol = row.get("day_volume")
         prev = row.get("prev_close")
 
-        price_str = f"{price:.2f}" if price is not None and price == price else "  N/A"
-        chg_str = f"{chg:+.2f}%" if chg is not None and chg == chg else "   N/A"
-        vol_str = f"{int(vol):,}" if vol is not None and vol == vol else "          N/A"
-        prev_str = f"{prev:.2f}" if prev is not None and prev == prev else "  N/A"
+        price_str = f"{price:.2f}" if pd.notna(price) else "  N/A"
+        chg_str = f"{chg:+.2f}%" if pd.notna(chg) else "   N/A"
+        vol_str = f"{int(vol):,}" if pd.notna(vol) else "          N/A"
+        prev_str = f"{prev:.2f}" if pd.notna(prev) else "  N/A"
 
         print(
             f"{ticker_str:<{col_w['ticker']}}  "
