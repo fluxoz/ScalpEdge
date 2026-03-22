@@ -1245,7 +1245,7 @@ class TestStrategies:
         )
 
     def test_ml_engine_score_passthrough_when_unfitted(self):
-        """Regression: unfitted MLEngine must return pass-through scores (≥ 1.0).
+        """Regression: unfitted MLEngine must return pass-through scores (== 1.0).
 
         Previously both unfitted sub-models returned 0.5, giving a combined
         score of 0.5, which fell below the default ml_score_threshold of 0.52
@@ -1256,8 +1256,8 @@ class TestStrategies:
         engine = MLEngine()
         df = pd.DataFrame({"close": np.linspace(100, 110, 50)})
         scores = engine.score(df)
-        assert (scores >= 1.0).all(), (
-            "Unfitted MLEngine.score() must return 1.0 (pass-through), "
+        assert (scores == 1.0).all(), (
+            "Unfitted MLEngine.score() must return exactly 1.0 (pass-through), "
             "not 0.5 which blocks signals below the default threshold."
         )
 

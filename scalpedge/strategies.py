@@ -505,6 +505,9 @@ class HybridStrategy(BaseStrategy):
     regime_lookback:
         Rolling-window size (in bars) for the VWAP trend calculation
         (default 5).
+    mc_rolling_window:
+        Number of bars used to estimate local drift and volatility in the
+        rolling MC filter (default 60, i.e. ~5 hours at 5-minute bars).
     """
 
     name = "hybrid"
@@ -531,6 +534,7 @@ class HybridStrategy(BaseStrategy):
         use_regime_filter: bool = False,
         spy_df: pd.DataFrame | None = None,
         regime_lookback: int = 5,
+        mc_rolling_window: int = 60,
     ) -> None:
         self.markov_order = markov_order
         self.mc_n_simulations = mc_n_simulations
@@ -552,6 +556,7 @@ class HybridStrategy(BaseStrategy):
         self.use_regime_filter = use_regime_filter
         self.spy_df = spy_df
         self.regime_lookback = regime_lookback
+        self.mc_rolling_window = mc_rolling_window
 
         self._markov = MarkovChain(order=markov_order)
         self._mc = MonteCarlo(n_simulations=mc_n_simulations)
@@ -666,18 +671,19 @@ class HybridStrategy(BaseStrategy):
     def _mc_filter(self, close: pd.Series) -> pd.Series:
         """Return True where rolling Monte Carlo P(up) >= 0.5.
 
-        Uses a 60-bar rolling window to estimate local drift and volatility,
-        then applies an analytical normal approximation for the probability
-        that the cumulative return over ``mc_n_bars`` bars exceeds
+        Uses a ``mc_rolling_window``-bar rolling window to estimate local drift
+        and volatility, then applies an analytical normal approximation for the
+        probability that the cumulative return over ``mc_n_bars`` bars exceeds
         ``mc_threshold_pct`` %.  Bars with insufficient rolling history
         (fewer than 20 observations) default to True (no filtering).
         """
         from scipy.stats import norm as _norm
 
         log_rets = np.log(close / close.shift(1))
-        window = 60  # bars for rolling drift/vol estimation
+        window = self.mc_rolling_window
 
         roll_mu = log_rets.rolling(window, min_periods=20).mean()
+        # Clip sigma away from zero to prevent division by zero in the z-score.
         roll_sigma = log_rets.rolling(window, min_periods=20).std().clip(lower=1e-10)
 
         threshold = self.mc_threshold_pct / 100.0
