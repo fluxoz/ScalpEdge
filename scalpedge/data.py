@@ -81,8 +81,8 @@ _INTERVAL_STEP: dict[str, pd.Timedelta] = {
 # Set to a positive float to re-enable pacing if needed (seconds per call).
 _POLYGON_RATE_LIMIT_SECONDS = 0.0
 
-# Stocks Advanced plan provides at least 5 years of minute-aggregate history.
-_POLYGON_MAX_HISTORY_DAYS = 1825
+# Stocks Advanced plan provides up to 20 years of history for every ticker.
+_POLYGON_MAX_HISTORY_DAYS = 7305
 
 # Maximum bars returned per Polygon API page (their documented hard limit).
 _POLYGON_MAX_LIMIT = 50_000
