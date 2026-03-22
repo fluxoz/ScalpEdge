@@ -24,6 +24,12 @@ Usage
     uv run python main.py scan SPY TSLA AAPL NVDA QQQ
     uv run python main.py scan --top 20                 # top 20 by absolute change %
 
+    # Live signal engine + TUI dashboard (requires POLYGON_API_KEY):
+    uv run python main.py live SPY TSLA NVDA            # TUI dashboard (default when textual installed)
+    uv run python main.py live --no-dashboard           # plain stdout fallback (no TUI)
+    uv run python main.py live SPY --no-ml              # disable ML scoring layer
+    uv run python main.py live SPY --buffer-size 200    # keep 200 bars in rolling buffer
+
 The ``data/`` directory is auto-created and grows on every run.
 """
 

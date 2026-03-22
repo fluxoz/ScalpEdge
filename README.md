@@ -64,7 +64,10 @@ uv sync --extra ml
 # 4. (Optional) Install streaming dependencies (websockets)
 uv sync --extra streaming
 
-# 5. Run the full backtest
+# 5. (Optional) Install TUI dashboard dependencies
+uv sync --extra tui
+
+# 6. Run the full backtest
 uv run python main.py
 ```
 
@@ -75,6 +78,7 @@ uv run python main.py
 uv sync                      # core deps only
 uv sync --extra ml           # + ML layer (optional)
 uv sync --extra streaming    # + WebSocket streaming (optional)
+uv sync --extra tui          # + TUI dashboard (optional)
 uv run python main.py
 ```
 
@@ -84,7 +88,8 @@ uv run python main.py
 pip install -e "."                        # core deps only
 pip install -e ".[ml]"                    # + ML layer (optional)
 pip install -e ".[streaming]"             # + WebSocket streaming (optional)
-pip install -e ".[ml,streaming]"          # everything
+pip install -e ".[tui]"                   # + TUI dashboard (optional)
+pip install -e ".[ml,streaming,tui]"      # everything
 python main.py
 ```
 
@@ -108,7 +113,9 @@ ScalpEdge/
     ├── options.py           # Black-Scholes pricing, Greeks, implied vol
     ├── ml.py                # RandomForest + PyTorch LSTM + MLEngine
     ├── backtester.py        # Vectorized backtester + full performance metrics
-    └── strategies.py        # TAStrategy (baseline) + HybridStrategy (all layers + catalyst filter)
+    ├── strategies.py        # TAStrategy (baseline) + HybridStrategy (all layers + catalyst filter)
+    ├── live_engine.py       # LiveSignalEngine: bar buffer, indicators, strategy, WebSocket feed
+    └── dashboard.py         # Textual TUI dashboard for live signal monitoring
 ```
 
 ---
@@ -187,6 +194,122 @@ asyncio.run(stream.run())
 ```
 
 The stream reconnects automatically with exponential back-off (max 60 s) on disconnect.
+
+---
+
+## Live TUI Dashboard
+
+ScalpEdge ships a full terminal UI powered by [Textual](https://github.com/Textualize/textual) that streams live 5-minute bars from Polygon, runs the full signal engine, and renders everything in real time — charts, indicators, signal log, and regime banner.
+
+### Install the TUI extra
+
+```bash
+pip install -e ".[tui]"
+# or with uv:
+uv sync --extra tui
+```
+
+This adds `textual`, `textual-plotext`, and `plotext`.
+
+### Launch
+
+```bash
+# Requires POLYGON_API_KEY (Stocks Advanced)
+export POLYGON_API_KEY="your_key_here"
+
+# Start with the default tickers:
+uv run python main.py live
+
+# Monitor specific tickers:
+uv run python main.py live SPY TSLA NVDA AAPL
+
+# Skip the TUI and print signals to stdout instead:
+uv run python main.py live SPY TSLA --no-dashboard
+
+# Disable the ML scoring layer (faster start):
+uv run python main.py live SPY TSLA --no-ml
+
+# Keep only 200 bars in the rolling per-ticker buffer:
+uv run python main.py live SPY --buffer-size 200
+```
+
+Press **Ctrl+C** to exit gracefully. While the TUI is running, all logging output is redirected to `scalpedge_live.log` in the working directory.
+
+### Dashboard layout
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  ScalpEdge  ──  🟢  BULLISH                 [regime banner] │
+├─────────────────────────────────────────────────────────────┤
+│  Overview │ SPY │ TSLA │ NVDA │ …            [tabbed panes] │
+│                                                             │
+│  ┌─ Candlestick + EMA9 ──────────────────────────────────┐  │
+│  │  (plotext chart, last 120 bars)                       │  │
+│  └───────────────────────────────────────────────────────┘  │
+│  ┌─ Volume ──────────┐ ┌─ Indicator stats ───────────────┐  │
+│  │  colour-coded bars│ │ RSI · MACD · ADX · VWAP Δ      │  │
+│  └───────────────────┘ └────────────────────────────────-┘  │
+│  ┌─ RSI ─────────────────────────────────────────────────┐  │
+│  │  (with 70 / 30 reference lines)                       │  │
+│  └───────────────────────────────────────────────────────┘  │
+│  ┌─ MACD histogram ──────────────────────────────────────┐  │
+│  │  (green above zero, red below zero)                   │  │
+│  └───────────────────────────────────────────────────────┘  │
+│  ┌─ ADX / DI +/− ────────────────────────────────────────┐  │
+│  │                                                       │  │
+│  └───────────────────────────────────────────────────────┘  │
+├─────────────────────────────────────────────────────────────┤
+│  HH:MM  🟢 LONG  SPY  $519.12  RSI 58 …    [signal log]    │
+│  HH:MM  ⚪ FLAT  TSLA  $185.50 RSI 44 …                    │
+├─────────────────────────────────────────────────────────────┤
+│  Signals: 3 · Uptime: 00:12:34 · Last bar: 10:35  [footer] │
+└─────────────────────────────────────────────────────────────┘
+```
+
+| Panel | Description |
+|---|---|
+| **Regime banner** | SPY market regime (🟢 BULLISH / 🔴 BEARISH / ⚪ NEUTRAL) via two-factor vote (close vs. VWAP + EMA-21) |
+| **Overview tab** | Compact grid — price, RSI/MACD/ADX/VWAP Δ, signal badge, OHLCV, per-ticker signal count |
+| **Per-ticker tabs** | Candlestick + EMA9, volume bars, RSI, MACD histogram, ADX + DI+/DI− |
+| **Signal log** | Scrolling `RichLog` — timestamp · signal · ticker · price · indicator snapshot |
+| **Session bar** | Total signals fired, uptime, last bar timestamp |
+
+### Keyboard shortcuts
+
+| Key | Action |
+|---|---|
+| `/` | Focus the ticker search box |
+| `Enter` (in search) | Jump to the tab for the typed symbol (exact → prefix → substring match) |
+| `Escape` | Clear the search box |
+| `Ctrl+C` | Quit |
+
+### `on_bar_update` callback
+
+If you integrate `LiveSignalEngine` directly instead of using `main.py`, wire the
+`on_bar_update` callback to receive every processed bar (not just signal bars):
+
+```python
+import asyncio
+from scalpedge.live_engine import LiveSignalEngine
+from scalpedge.strategies import HybridStrategy
+
+def handle_signal(event) -> None:
+    print(event)
+
+def handle_bar(ticker: str, bar: dict, last_signal: int) -> None:
+    # fired on every bar — use for chart updates, custom logging, etc.
+    print(f"[{ticker}] close={bar['close']:.2f}  signal={last_signal}")
+
+strategy = HybridStrategy(use_ml=False)
+engine = LiveSignalEngine(
+    tickers=["SPY", "TSLA"],
+    strategy=strategy,
+    on_signal=handle_signal,
+    on_bar_update=handle_bar,   # fires every bar, not just signal bars
+)
+
+asyncio.run(engine.run())
+```
 
 ---
 
@@ -384,6 +507,8 @@ signals = strategy.generate_signals(df)
 | ML | `ml.py` | RandomForest + PyTorch LSTM → combined P(up) score; microstructure features (`spread_pct`, `bid_ask_imbalance`, `imbalance_ma_10`) included when available |
 | Backtester | `backtester.py` | Vectorized simulation, fee+slippage, equity curve, full metrics |
 | Strategies | `strategies.py` | TAStrategy (baseline) + HybridStrategy (all layers + optional catalyst suppression & market regime filters) + VWAPMeanReversionStrategy (VWAP-anchored mean reversion with ATR exits) |
+| Live Engine | `live_engine.py` | Connects to Polygon WebSocket, maintains rolling bar buffer per ticker, computes indicators on every bar, fires `on_signal` / `on_bar_update` callbacks |
+| Dashboard | `dashboard.py` | Textual TUI — charts, regime banner, signal log, ticker search; launched automatically by `main.py live` when `textual` is installed |
 
 ---
 
