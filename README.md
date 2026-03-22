@@ -18,6 +18,7 @@ Combines:
 - **Vectorized backtester** with realistic fees, slippage, and full metrics
 - **Bid-ask microstructure features** from NBBO quote data (spread, imbalance)
 - **Catalyst suppression filter** to avoid trading around earnings/events
+- **Market regime filter** — SPY 5-bar rolling VWAP gates signals for other tickers
 - **Real-time WebSocket streaming** via Polygon Stocks Advanced
 
 ---
@@ -258,6 +259,52 @@ Catalyst dates can also be fetched automatically via `PolygonClient.fetch_events
 
 ---
 
+## Market Regime Filter (SPY Benchmark)
+
+The **market regime filter** tracks SPY's intraday trend using a rolling
+5-bar VWAP and gates entry signals for other tickers accordingly.
+
+* **Bullish regime** (SPY close > 5-bar VWAP) → long entries allowed.
+* **Bearish regime** (SPY close < 5-bar VWAP) → long entries suppressed.
+* **Neutral** (insufficient history, first ≤ 4 bars) → entries allowed.
+
+### Standalone regime computation
+
+```python
+from scalpedge.ta_indicators import compute_market_regime
+
+# spy_df: a standard OHLCV DataFrame with high/low/close/volume columns
+regime = compute_market_regime(spy_df, lookback=5)
+# regime is a pd.Series of integers: 1 (bullish), -1 (bearish), 0 (neutral)
+```
+
+### Enable in HybridStrategy
+
+```python
+import pandas as pd
+from scalpedge.data import DataManager
+from scalpedge.strategies import HybridStrategy
+
+dm = DataManager()
+spy_df = dm.load("SPY")   # load SPY benchmark data
+
+strategy = HybridStrategy(
+    use_regime_filter=True,
+    spy_df=spy_df,
+    regime_lookback=5,      # 5-bar rolling VWAP (default)
+)
+signals = strategy.generate_signals(tsla_df)
+```
+
+When `main.py` is run with multiple tickers, SPY is loaded once and
+automatically passed as the regime benchmark for all non-SPY tickers:
+
+```bash
+uv run python main.py backtest TSLA AAPL NVDA
+```
+
+---
+
 ## Layers Explained
 
 | Layer | Module | What it does |
@@ -268,7 +315,7 @@ Catalyst dates can also be fetched automatically via `PolygonClient.fetch_events
 | Options | `options.py` | Black-Scholes call/put, delta, gamma, vega, theta, rho, implied vol |
 | ML | `ml.py` | RandomForest + PyTorch LSTM → combined P(up) score; microstructure features (`spread_pct`, `bid_ask_imbalance`, `imbalance_ma_10`) included when available |
 | Backtester | `backtester.py` | Vectorized simulation, fee+slippage, equity curve, full metrics |
-| Strategies | `strategies.py` | TAStrategy (baseline) + HybridStrategy (all layers + optional catalyst suppression filter) |
+| Strategies | `strategies.py` | TAStrategy (baseline) + HybridStrategy (all layers + optional catalyst suppression & market regime filters) |
 
 ---
 

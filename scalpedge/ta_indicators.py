@@ -21,6 +21,15 @@ Optional visualization
 ----------------------
 ``plot_volume_profile(df, session_date)`` renders a horizontal volume-profile
 histogram overlaid on the session price chart.  Requires ``matplotlib``.
+
+Market Regime
+-------------
+``compute_market_regime(spy_df, lookback=5)`` uses a rolling *lookback*-bar
+VWAP on SPY (or any benchmark) to characterise the intraday trend:
+
+* ``1``  — bullish (close > rolling VWAP)
+* ``-1`` — bearish (close < rolling VWAP)
+* ``0``  — neutral  (close == rolling VWAP, rare)
 """
 
 from __future__ import annotations
@@ -220,6 +229,51 @@ def add_quote_features(df: pd.DataFrame) -> pd.DataFrame:
     df["imbalance_ma_10"] = df["bid_ask_imbalance"].rolling(10).mean()
 
     return df
+
+
+# ---------------------------------------------------------------------------
+# Market regime
+# ---------------------------------------------------------------------------
+
+def compute_market_regime(spy_df: pd.DataFrame, lookback: int = 5) -> pd.Series:
+    """Compute intraday market regime using a rolling VWAP on a benchmark.
+
+    Typical usage: pass SPY 5-minute OHLCV data to get a bar-by-bar regime
+    label that can be used to gate entry signals for other tickers.
+
+    Parameters
+    ----------
+    spy_df : pd.DataFrame
+        OHLCV DataFrame for the benchmark (usually SPY).  Must contain
+        ``high``, ``low``, ``close``, and ``volume`` columns.
+    lookback : int
+        Rolling window in bars for the VWAP computation (default 5).
+        Typical-price × volume is summed over the last *lookback* bars.
+
+    Returns
+    -------
+    pd.Series
+        Integer Series (same index as *spy_df*) with values:
+
+        *  ``1``  — bullish: close > rolling VWAP
+        * ``-1``  — bearish: close < rolling VWAP
+        *  ``0``  — neutral: close == rolling VWAP (or insufficient history)
+    """
+    h = spy_df["high"].astype(float)
+    low = spy_df["low"].astype(float)
+    c = spy_df["close"].astype(float)
+    v = spy_df["volume"].astype(float)
+
+    typical_price = (h + low + c) / 3
+    rolling_tpv = (typical_price * v).rolling(lookback).sum()
+    rolling_vol = v.rolling(lookback).sum()
+    rolling_vwap = rolling_tpv / rolling_vol.replace(0, np.nan)
+
+    regime = pd.Series(0, index=spy_df.index, dtype=int)
+    regime[c > rolling_vwap] = 1
+    regime[c < rolling_vwap] = -1
+
+    return regime
 
 
 # ---------------------------------------------------------------------------
