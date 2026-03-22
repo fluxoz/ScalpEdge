@@ -8,6 +8,7 @@ signal layers into a single entry signal:
 * Monte Carlo probability filter
 * Black-Scholes delta filter (option premium reasonability gate)
 * ML score filter (RF + LSTM combined probability)
+* Market regime filter (SPY 5-bar rolling VWAP trend gate)
 
 New strategies can be added by subclassing :class:`BaseStrategy` or by
 passing custom ``rule_fn`` callables to :class:`HybridStrategy`.
@@ -106,7 +107,7 @@ class TAStrategy(BaseStrategy):
 # ---------------------------------------------------------------------------
 
 class HybridStrategy(BaseStrategy):
-    """Hybrid strategy combining TA + Markov + MonteCarlo + BS delta + ML.
+    """Hybrid strategy combining TA + Markov + MonteCarlo + BS delta + ML + regime.
 
     Parameters
     ----------
@@ -149,6 +150,18 @@ class HybridStrategy(BaseStrategy):
     catalyst_suppress_bars:
         Half-window of bars to suppress around each catalyst (default 6,
         i.e. ±30 min at 5-minute bars).
+    use_regime_filter:
+        When ``True`` and *spy_df* is provided, suppress long entry signals
+        during bearish market regimes (SPY close < rolling VWAP) and suppress
+        short entry signals during bullish regimes.  When the ticker being
+        traded IS SPY, you may still pass *spy_df* or set this to ``False``.
+    spy_df:
+        SPY (or other benchmark) OHLCV DataFrame used to compute the market
+        regime.  Must contain ``high``, ``low``, ``close``, ``volume``, and
+        ``datetime`` columns.  Required when *use_regime_filter* is ``True``.
+    regime_lookback:
+        Rolling-window size (in bars) for the VWAP trend calculation
+        (default 5).
     """
 
     name = "hybrid"
@@ -172,6 +185,9 @@ class HybridStrategy(BaseStrategy):
         use_catalyst_filter: bool = False,
         catalyst_dates: list[pd.Timestamp] | None = None,
         catalyst_suppress_bars: int = 6,
+        use_regime_filter: bool = False,
+        spy_df: pd.DataFrame | None = None,
+        regime_lookback: int = 5,
     ) -> None:
         self.markov_order = markov_order
         self.mc_n_simulations = mc_n_simulations
@@ -190,6 +206,9 @@ class HybridStrategy(BaseStrategy):
         self.use_catalyst_filter = use_catalyst_filter
         self.catalyst_dates = catalyst_dates or []
         self.catalyst_suppress_bars = catalyst_suppress_bars
+        self.use_regime_filter = use_regime_filter
+        self.spy_df = spy_df
+        self.regime_lookback = regime_lookback
 
         self._markov = MarkovChain(order=markov_order)
         self._mc = MonteCarlo(n_simulations=mc_n_simulations)
@@ -271,6 +290,13 @@ class HybridStrategy(BaseStrategy):
             combined = combined & rule_fn(df).astype(bool)
 
         # ----------------------------------------------------------------
+        # Layer 6 — Market regime filter (SPY rolling VWAP trend)
+        # ----------------------------------------------------------------
+        if self.use_regime_filter and self.spy_df is not None:
+            regime_signal = self._regime_filter(df)
+            combined = combined & regime_signal
+
+        # ----------------------------------------------------------------
         # Catalyst suppression filter (final gate)
         # ----------------------------------------------------------------
         combined = self._apply_catalyst_filter(combined.astype(int), df).astype(bool)
@@ -330,6 +356,76 @@ class HybridStrategy(BaseStrategy):
 
         passes = atm_delta >= self.bs_min_delta
         return pd.Series(passes, index=close.index)
+
+    def _regime_filter(self, df: pd.DataFrame) -> pd.Series:
+        """Return True at bars where the market regime allows a long entry.
+
+        Uses a rolling *regime_lookback*-bar VWAP on *spy_df* to determine
+        the intraday market bias:
+
+        * Bullish regime (SPY close > rolling VWAP) → entry allowed.
+        * Bearish regime (SPY close < rolling VWAP) → entry suppressed.
+
+        Timestamps are aligned via forward-fill so that SPY and the target
+        ticker can have slightly different bar timestamps (e.g. due to NaN
+        warm-up rows being dropped).  Falls back to all-True (allow all) when
+        *spy_df* is ``None`` or too short to compute the rolling VWAP.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            The ticker's OHLCV DataFrame.  Must contain a ``datetime`` column.
+
+        Returns
+        -------
+        pd.Series
+            Boolean Series (same index as *df*) — True where the regime
+            allows a long entry.
+        """
+        from .ta_indicators import compute_market_regime
+
+        if self.spy_df is None or self.spy_df.empty:
+            return pd.Series(True, index=df.index)
+
+        spy_regime = compute_market_regime(self.spy_df, lookback=self.regime_lookback)
+
+        if "datetime" not in df.columns or "datetime" not in self.spy_df.columns:
+            # Cannot align without datetime — fall back to allow-all.
+            logger.warning(
+                "regime_filter: 'datetime' column missing; regime filter skipped."
+            )
+            return pd.Series(True, index=df.index)
+
+        # Build a datetime-indexed Series for SPY regime.
+        spy_dt = pd.to_datetime(self.spy_df["datetime"])
+        spy_regime_dt = pd.Series(spy_regime.values, index=spy_dt)
+
+        # Remove duplicate timestamps (keep last).
+        spy_regime_dt = spy_regime_dt[~spy_regime_dt.index.duplicated(keep="last")]
+        ticker_dt = pd.to_datetime(df["datetime"])
+
+        # Normalize timezone awareness so that both indices are comparable.
+        # Convert to UTC if either side is tz-aware; strip tz otherwise.
+        spy_tz = spy_regime_dt.index.tz
+        ticker_tz = ticker_dt.dt.tz
+        if spy_tz is None and ticker_tz is not None:
+            spy_regime_dt.index = spy_regime_dt.index.tz_localize(ticker_tz)
+        elif spy_tz is not None and ticker_tz is None:
+            ticker_dt = ticker_dt.dt.tz_localize(spy_tz)
+        # If both are tz-aware but different zones, convert ticker to spy's zone.
+        elif spy_tz is not None and ticker_tz is not None and spy_tz != ticker_tz:
+            ticker_dt = ticker_dt.dt.tz_convert(spy_tz)
+
+        # Reindex: for each ticker bar find the most recent SPY regime value.
+        ticker_idx = pd.DatetimeIndex(ticker_dt)
+        combined_idx = spy_regime_dt.index.union(ticker_idx).sort_values()
+        aligned = spy_regime_dt.reindex(combined_idx).ffill()
+        aligned = aligned.reindex(ticker_idx)
+
+        # Neutral (0) bars — not enough history — are treated as allowing entry.
+        regime_values = aligned.fillna(0).values
+        result = pd.Series(regime_values >= 0, index=df.index)
+        return result
 
     def _apply_catalyst_filter(
         self,

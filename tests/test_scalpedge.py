@@ -1219,8 +1219,224 @@ class TestStrategies:
 
 
 # ---------------------------------------------------------------------------
-# PolygonClient — Stocks Advanced features
+# Market Regime Filter
 # ---------------------------------------------------------------------------
+
+class TestMarketRegime:
+    """Tests for compute_market_regime() and HybridStrategy regime filter."""
+
+    def _make_ohlcv(self, n: int = 50, trend: str = "up") -> pd.DataFrame:
+        """Small synthetic OHLCV DataFrame.
+
+        Parameters
+        ----------
+        trend : 'up' | 'down' | 'flat'
+            Controls whether prices trend above or below the rolling VWAP.
+        """
+        np.random.seed(0)
+        if trend == "up":
+            close = 450.0 + np.arange(n) * 0.5
+        elif trend == "down":
+            close = 450.0 - np.arange(n) * 0.5
+        else:
+            close = np.full(n, 450.0)
+
+        volume = np.full(n, 100_000.0)
+        return pd.DataFrame(
+            {
+                "datetime": pd.date_range("2024-01-02 09:30", periods=n, freq="5min", tz="UTC"),
+                "open": close * 0.999,
+                "high": close * 1.001,
+                "low": close * 0.999,
+                "close": close,
+                "volume": volume,
+                "ticker": "SPY",
+            }
+        )
+
+    def test_compute_regime_returns_correct_dtype(self):
+        """compute_market_regime should return an integer Series."""
+        from scalpedge.ta_indicators import compute_market_regime
+
+        spy = self._make_ohlcv(30)
+        regime = compute_market_regime(spy, lookback=5)
+        assert isinstance(regime, pd.Series)
+        assert len(regime) == 30
+        assert set(regime.dropna().unique()).issubset({-1, 0, 1})
+
+    def test_compute_regime_bullish_trend(self):
+        """Uptrending prices → mostly bullish regime (1) after warm-up."""
+        from scalpedge.ta_indicators import compute_market_regime
+
+        spy = self._make_ohlcv(30, trend="up")
+        regime = compute_market_regime(spy, lookback=5)
+        # Skip NaN warm-up rows (first lookback-1 bars may be NaN → regime=0)
+        regime_valid = regime.iloc[5:]
+        assert (regime_valid == 1).all(), "Expected bullish regime for uptrend"
+
+    def test_compute_regime_bearish_trend(self):
+        """Downtrending prices → mostly bearish regime (-1) after warm-up."""
+        from scalpedge.ta_indicators import compute_market_regime
+
+        spy = self._make_ohlcv(30, trend="down")
+        regime = compute_market_regime(spy, lookback=5)
+        regime_valid = regime.iloc[5:]
+        assert (regime_valid == -1).all(), "Expected bearish regime for downtrend"
+
+    def test_compute_regime_neutral(self):
+        """Flat prices (close == VWAP) → neutral regime (0)."""
+        from scalpedge.ta_indicators import compute_market_regime
+
+        # Perfectly flat close with uniform volume → typical_price == close == VWAP
+        n = 20
+        close = np.full(n, 450.0)
+        df = pd.DataFrame(
+            {
+                "high": close,
+                "low": close,
+                "close": close,
+                "volume": np.full(n, 1000.0),
+            }
+        )
+        regime = compute_market_regime(df, lookback=5)
+        regime_valid = regime.iloc[5:]
+        assert (regime_valid == 0).all(), "Expected neutral regime for flat price"
+
+    def test_hybrid_regime_filter_suppresses_signals_in_bearish_market(self, clean_df):
+        """Regime filter should reduce long signals when SPY is in bearish trend."""
+        from scalpedge.strategies import HybridStrategy
+
+        # Build a strongly bearish SPY DataFrame that spans the same period.
+        n = len(clean_df)
+        spy_close = 450.0 - np.arange(n) * 0.5  # strongly downtrending
+        spy_df = pd.DataFrame(
+            {
+                "datetime": clean_df["datetime"].values,
+                "open": spy_close * 0.999,
+                "high": spy_close * 1.001,
+                "low": spy_close * 0.999,
+                "close": spy_close,
+                "volume": np.full(n, 500_000.0),
+                "ticker": "SPY",
+            }
+        )
+
+        # Strategy WITHOUT regime filter.
+        strategy_no_regime = HybridStrategy(
+            use_ml=False, use_markov=False, use_mc=False, use_bs=False,
+        )
+        signals_no_regime = strategy_no_regime.generate_signals(clean_df)
+
+        # Strategy WITH bearish SPY regime filter.
+        strategy_regime = HybridStrategy(
+            use_ml=False, use_markov=False, use_mc=False, use_bs=False,
+            use_regime_filter=True,
+            spy_df=spy_df,
+            regime_lookback=5,
+        )
+        signals_regime = strategy_regime.generate_signals(clean_df)
+
+        assert len(signals_regime) == len(clean_df)
+        assert signals_regime.isin([0, 1]).all()
+        # Regime filter in a bearish market should only suppress, never add signals.
+        assert (signals_regime <= signals_no_regime).all(), (
+            "Regime filter must not introduce new signals"
+        )
+        # In a bearish market the filter should eliminate at least some signals
+        # (if there were any to eliminate).
+        if signals_no_regime.sum() > 0:
+            assert signals_regime.sum() < signals_no_regime.sum(), (
+                "Bearish regime filter should suppress some long signals"
+            )
+
+    def test_hybrid_regime_filter_allows_signals_in_bullish_market(self, clean_df):
+        """Regime filter should not suppress signals when SPY is in bullish trend."""
+        from scalpedge.strategies import HybridStrategy
+
+        n = len(clean_df)
+        spy_close = 200.0 + np.arange(n) * 0.5  # strongly uptrending
+        spy_df = pd.DataFrame(
+            {
+                "datetime": clean_df["datetime"].values,
+                "open": spy_close * 0.999,
+                "high": spy_close * 1.001,
+                "low": spy_close * 0.999,
+                "close": spy_close,
+                "volume": np.full(n, 500_000.0),
+                "ticker": "SPY",
+            }
+        )
+
+        strategy_no_regime = HybridStrategy(
+            use_ml=False, use_markov=False, use_mc=False, use_bs=False,
+        )
+        signals_no_regime = strategy_no_regime.generate_signals(clean_df)
+
+        strategy_regime = HybridStrategy(
+            use_ml=False, use_markov=False, use_mc=False, use_bs=False,
+            use_regime_filter=True,
+            spy_df=spy_df,
+            regime_lookback=5,
+        )
+        signals_regime = strategy_regime.generate_signals(clean_df)
+
+        # In a bullish market, regime filter should not suppress ANY signals
+        # beyond what the warm-up period (first lookback bars default to 0=neutral)
+        # might filter.  After warm-up every signal should pass through.
+        assert (signals_regime <= signals_no_regime).all(), (
+            "Regime filter must not introduce new signals"
+        )
+        # Post warm-up: bullish SPY should allow all TA signals through.
+        warmup = 5
+        assert (signals_regime.iloc[warmup:] == signals_no_regime.iloc[warmup:]).all(), (
+            "After warm-up, bullish regime should not suppress any signal"
+        )
+
+    def test_hybrid_regime_filter_disabled_by_default(self, clean_df):
+        """Regime filter must be off by default (use_regime_filter=False)."""
+        from scalpedge.strategies import HybridStrategy
+
+        strategy = HybridStrategy(use_ml=False, use_markov=False, use_mc=False, use_bs=False)
+        assert not strategy.use_regime_filter
+        assert strategy.spy_df is None
+
+    def test_hybrid_regime_filter_no_spy_df(self, clean_df):
+        """When spy_df is None the regime filter must not suppress any signals."""
+        from scalpedge.strategies import HybridStrategy
+
+        strategy_base = HybridStrategy(
+            use_ml=False, use_markov=False, use_mc=False, use_bs=False,
+        )
+        strategy_regime = HybridStrategy(
+            use_ml=False, use_markov=False, use_mc=False, use_bs=False,
+            use_regime_filter=True,
+            spy_df=None,
+        )
+        base_signals = strategy_base.generate_signals(clean_df)
+        regime_signals = strategy_regime.generate_signals(clean_df)
+        pd.testing.assert_series_equal(base_signals, regime_signals)
+
+    def test_regime_filter_handles_missing_datetime(self, clean_df):
+        """_regime_filter should fall back to allow-all when datetime column is absent."""
+        from scalpedge.strategies import HybridStrategy
+
+        n = len(clean_df)
+        spy_no_dt = pd.DataFrame(
+            {
+                "high": np.full(n, 451.0),
+                "low": np.full(n, 449.0),
+                "close": np.full(n, 450.0),
+                "volume": np.full(n, 100_000.0),
+            }
+        )
+        strategy = HybridStrategy(
+            use_ml=False, use_markov=False, use_mc=False, use_bs=False,
+            use_regime_filter=True,
+            spy_df=spy_no_dt,
+        )
+        # Should not raise; should fall back gracefully.
+        result = strategy._regime_filter(clean_df)
+        assert result.all()
 
 class TestPolygonClientAdvanced:
     """Tests for the new Stocks Advanced methods on PolygonClient."""

@@ -215,8 +215,18 @@ def cmd_scan(args: argparse.Namespace) -> None:
         )
 
 
-def run_backtest(ticker: str) -> None:
-    """Fetch data, compute indicators, fit ML, and run hybrid backtest."""
+def run_backtest(ticker: str, spy_df: pd.DataFrame | None = None) -> None:
+    """Fetch data, compute indicators, fit ML, and run hybrid backtest.
+
+    Parameters
+    ----------
+    ticker : str
+        The ticker symbol to backtest.
+    spy_df : pd.DataFrame or None
+        Pre-loaded SPY 5-minute OHLCV DataFrame used for the market regime
+        filter.  When provided and the ticker is not SPY, the regime filter
+        is enabled automatically.  Pass ``None`` to disable the regime filter.
+    """
     from scalpedge.data import DataManager
     from scalpedge.ta_indicators import add_all_indicators
     from scalpedge.strategies import HybridStrategy, TAStrategy
@@ -263,8 +273,25 @@ def run_backtest(ticker: str) -> None:
     train_df = df.iloc[:split]
     test_df = df.iloc[split:]
 
+    # ------------------------------------------------------------------
+    # 4a. Configure market regime filter (SPY benchmark, non-SPY tickers)
+    # ------------------------------------------------------------------
+    use_regime = spy_df is not None and ticker.upper() != "SPY"
+    if use_regime:
+        logger.info(
+            "[%s] Market regime filter ENABLED — using SPY 5-bar rolling VWAP.",
+            ticker,
+        )
+
+    hybrid_cfg = dict(
+        **HYBRID_CONFIG,
+        use_regime_filter=use_regime,
+        spy_df=spy_df if use_regime else None,
+        regime_lookback=5,
+    )
+
     logger.info("[%s] Fitting ML models on %d bars (train set) ...", ticker, len(train_df))
-    strategy = HybridStrategy(**HYBRID_CONFIG)
+    strategy = HybridStrategy(**hybrid_cfg)
     strategy.fit_ml(train_df)
 
     # ------------------------------------------------------------------
@@ -438,10 +465,29 @@ def main() -> None:
             "Install with: uv sync --extra ml  or  pip install -e '.[ml]'"
         )
 
+    # ------------------------------------------------------------------
+    # Load SPY benchmark data once for the market regime filter.
+    # Used by all non-SPY tickers.  Failures are non-fatal.
+    # ------------------------------------------------------------------
+    spy_df: pd.DataFrame | None = None
+    if any(t.upper() != "SPY" for t in tickers):
+        try:
+            from scalpedge.data import DataManager
+
+            _dm = DataManager()
+            spy_df = _dm.load("SPY")
+            logger.info("SPY benchmark loaded: %d bars (for regime filter).", len(spy_df))
+        except Exception as _exc:
+            logger.warning(
+                "Could not load SPY data for regime filter (%s). "
+                "Regime filter will be disabled.",
+                _exc,
+            )
+
     results = {}
     for ticker in tickers:
         try:
-            run_backtest(ticker)
+            run_backtest(ticker, spy_df=spy_df)
             results[ticker] = "OK"
         except Exception as exc:
             logger.error("Failed to backtest %s: %s", ticker, exc, exc_info=True)
