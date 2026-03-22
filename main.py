@@ -311,6 +311,102 @@ def run_backtest(ticker: str, spy_df: pd.DataFrame | None = None) -> None:
     _plot_equity(hybrid_result, ticker)
 
 
+def _print_signal(event) -> None:
+    """Print a formatted signal notification to stdout."""
+    print(str(event))
+
+
+def cmd_live(args: argparse.Namespace) -> None:
+    """Seed historical buffer, fit strategy, then stream live bars from Polygon."""
+    import asyncio
+
+    from scalpedge.data import DataManager
+    from scalpedge.ta_indicators import add_all_indicators
+    from scalpedge.strategies import HybridStrategy
+    from scalpedge.live_engine import LiveSignalEngine
+
+    tickers: list[str] = [t.upper() for t in args.tickers] if args.tickers else TICKERS
+
+    use_ml_live = _HAS_ML and not getattr(args, "no_ml", False)
+    buffer_size: int = getattr(args, "buffer_size", 500) or 500
+
+    logger.info("Live engine starting — tickers=%s  use_ml=%s  buffer_size=%d",
+                tickers, use_ml_live, buffer_size)
+
+    dm = DataManager()
+
+    # ------------------------------------------------------------------
+    # 1. Load historical data + compute indicators for each ticker
+    # ------------------------------------------------------------------
+    ticker_dfs: dict = {}
+    spy_df = None
+
+    # Load SPY for regime filter (non-SPY tickers)
+    if any(t != "SPY" for t in tickers):
+        try:
+            raw_spy = dm.load("SPY")
+            spy_df = add_all_indicators(raw_spy)
+            spy_df = spy_df.dropna(subset=["ema_50", "rsi_14", "macd", "atr_14"]).reset_index(
+                drop=True
+            )
+            logger.info("SPY benchmark loaded: %d bars.", len(spy_df))
+        except Exception as exc:
+            logger.warning("Could not load SPY for regime filter (%s). Regime filter disabled.", exc)
+
+    for ticker in tickers:
+        try:
+            logger.info("[%s] Loading historical data …", ticker)
+            raw_df = dm.load(ticker)
+            df = add_all_indicators(raw_df)
+            df = df.dropna(subset=["ema_50", "rsi_14", "macd", "atr_14"]).reset_index(drop=True)
+            logger.info("[%s] %d bars after indicator warm-up.", ticker, len(df))
+            ticker_dfs[ticker] = df
+        except Exception as exc:
+            logger.error("[%s] Failed to load historical data: %s", ticker, exc)
+
+    if not ticker_dfs:
+        logger.error("No ticker data loaded. Exiting.")
+        return
+
+    # Use first ticker's data for ML fitting; fall back gracefully
+    primary_ticker = next(iter(ticker_dfs))
+    primary_df = ticker_dfs[primary_ticker]
+
+    # ------------------------------------------------------------------
+    # 2. Fit HybridStrategy on 80% of historical data
+    # ------------------------------------------------------------------
+    use_regime = spy_df is not None and any(t != "SPY" for t in tickers)
+    hybrid_cfg = dict(
+        **HYBRID_CONFIG,
+        use_ml=use_ml_live,
+        use_regime_filter=use_regime,
+        spy_df=spy_df if use_regime else None,
+        regime_lookback=5,
+    )
+    strategy = HybridStrategy(**hybrid_cfg)
+
+    split = int(len(primary_df) * 0.80)
+    train_df = primary_df.iloc[:split]
+    logger.info("[%s] Fitting ML models on %d bars …", primary_ticker, len(train_df))
+    strategy.fit_ml(train_df)
+
+    # ------------------------------------------------------------------
+    # 3. Create engine, seed buffers, and run
+    # ------------------------------------------------------------------
+    engine = LiveSignalEngine(
+        tickers=tickers,
+        strategy=strategy,
+        on_signal=_print_signal,
+        buffer_size=buffer_size,
+        api_key=getattr(args, "api_key", None) or None,
+    )
+
+    for ticker, df in ticker_dfs.items():
+        engine.seed(ticker, df)
+
+    asyncio.run(engine.run())
+
+
 def _plot_equity(result, ticker: str) -> None:
     """Save an equity-curve plot to the data directory (non-blocking)."""
     try:
@@ -442,6 +538,41 @@ def main() -> None:
         help="Limit output to the top N tickers by absolute change %% (e.g. --top 20).",
     )
 
+    # ------------------------------------------------------------------ #
+    # live sub-command                                                     #
+    # ------------------------------------------------------------------ #
+    live_parser = subparsers.add_parser(
+        "live",
+        help=(
+            "Stream live bars from Polygon and emit signals in real time "
+            "(requires POLYGON_API_KEY with Stocks Advanced)."
+        ),
+    )
+    live_parser.add_argument(
+        "tickers",
+        nargs="*",
+        metavar="TICKER",
+        help=(
+            "Tickers to stream.  Defaults to SPY and TSLA when omitted "
+            "(e.g. SPY TSLA AAPL)."
+        ),
+    )
+    live_parser.add_argument(
+        "--no-ml",
+        action="store_true",
+        dest="no_ml",
+        default=False,
+        help="Disable the ML layer even when scikit-learn and torch are installed.",
+    )
+    live_parser.add_argument(
+        "--buffer-size",
+        type=int,
+        default=500,
+        dest="buffer_size",
+        metavar="N",
+        help="Number of bars to keep in the rolling buffer per ticker (default: 500).",
+    )
+
     args = parser.parse_args()
 
     if args.command == "fetch":
@@ -450,6 +581,10 @@ def main() -> None:
 
     if args.command == "scan":
         cmd_scan(args)
+        return
+
+    if args.command == "live":
+        cmd_live(args)
         return
 
     # Default / explicit backtest path.
